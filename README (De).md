@@ -42,5 +42,5 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 Dieses Projekt steht unter der GPL-3.0 Lizenz. Du kannst den Code frei verwenden, modifizieren und verteilen, solange die Lizenzbedingungen eingehalten werden.
 
 ## Autoren
-AveYo: Originalentwickler<br>
+AveYo: Originalentwickler (06.04.2019)<br>
 rjcncpt: Bearbeiter (Stand: 27.05.2025)
