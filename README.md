@@ -1,7 +1,7 @@
 # MicMute 2
 MicMute is a small Windows tool that allows you to quickly mute or unmute the microphone via a system tray icon. It displays the current microphone state (on/off) through the tray icon and saves this state in a configuration file. The program is ideal for users looking for a simple way to control their microphone during video conferences or voice recordings.
 
-![mic-on](https://github.com/user-attachments/assets/7189b8b8-e20e-46b7-8fe6-42e424ca83a3) ![mic-off](https://github.com/user-attachments/assets/0fd4c45a-217f-4db6-bda7-6546e2f9602d)
+![mic-on-off](https://github.com/user-attachments/assets/bf6d5547-9c64-44c6-81b4-b6903bdf4ce1)
 
 ## Features
 - System Tray Icon: Displays whether the microphone is on or muted.
