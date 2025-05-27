@@ -34,15 +34,11 @@ jobs:
         run: |
           zip -r micmute.zip micmute
 
-      - name: Get current date
-        id: date
-        run: echo "date=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
-
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: micmute-release-${{ steps.date.outputs.date }}
+          tag_name: micmute-${{ steps.version.outputs.version }}
           name: MicMute ${{ steps.version.outputs.version }}
           draft: false
           prerelease: false
