@@ -16,7 +16,7 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 
 ## Installation
 1. **Download:**
-   - Lade den [main-Zweig](https://github.com/rjcncpt/micmute/archive/refs/heads/main.zip) herunter.
+   - Lade die [ZIP-Datei](https://github.com/rjcncpt/micmute/releases) herunter.
    - Entpacke die ZIP-Datei.
    - Kopiere das micmute-Verzeichnis nach **`C:\`**.
 3. **Icons bereitstellen:**
