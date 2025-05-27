@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - 'main/micmute/**'
+      - 'micmute/**'
   workflow_dispatch:
 
 jobs:
@@ -17,12 +17,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Check if micmute directory exists
+        run: |
+          if [ ! -d "micmute" ]; then
+            echo "Error: Directory micmute does not exist"
+            exit 1
+          fi
+
       - name: Create ZIP archive
         run: |
-          cd main
           zip -r micmute.zip micmute
-          mv micmute.zip ../
-          cd ..
+          mv micmute.zip .
 
       - name: Get current date
         id: date
