@@ -42,5 +42,5 @@ MicMute is a small Windows tool that allows you to quickly mute or unmute the mi
 This project is licensed under the GPL-3.0 License. You can freely use, modify, and distribute the code as long as the license terms are followed.
 
 ## Authors
-AveYo: Original developer<br>
-rjcncpt: Editor (as of 05/27/2025)
+AveYo: Original developer (04/06/2019)<br>
+rjcncpt: Editor (05/27/2025)
