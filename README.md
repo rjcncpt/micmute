@@ -16,7 +16,7 @@ MicMute is a small Windows tool that allows you to quickly mute or unmute the mi
 
 ## Installation
 1. **Download:**
-   - Download the [main branch](https://github.com/rjcncpt/micmute/archive/refs/heads/main.zip).
+   - Download the [ZIP file](https://github.com/rjcncpt/micmute/releases).
    - Extract the ZIP file.
    - Copy the **`micmute`** directory to **`C:\`**.
 3. **Provide Icons:**
