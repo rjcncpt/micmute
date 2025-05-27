@@ -27,7 +27,6 @@ jobs:
       - name: Create ZIP archive
         run: |
           zip -r micmute.zip micmute
-          mv micmute.zip .
 
       - name: Get current date
         id: date
