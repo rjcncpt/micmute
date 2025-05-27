@@ -10,13 +10,15 @@ using System.IO;
 [assembly: AssemblyDescription("Edited by rjcncpt")]
 [assembly: AssemblyInformationalVersion("Edit date: 05/27/2025")]
 
-[assembly: AssemblyCompanyAttribute("Source: AveYo")]
+[assembly: AssemblyCompanyAttribute("AveYo")]
 [assembly: AssemblyVersionAttribute("2019.04.06")]
 
 namespace MicMute
 {
     class Program
     {
+        private const string Version = "v2.0.2";
+
         private const int WM_APPCOMMAND = 0x319;
         private const int APPCOMMAND_MICROPHONE_VOLUME_MUTE = 0x180000;
         private static readonly string configFile = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "MicMuteConfig.txt");
@@ -30,52 +32,81 @@ namespace MicMute
         private static NotifyIcon trayIcon;
         private static bool isMuted = false;
 
+        private static ToolStripMenuItem muteItem;
+        private static ToolStripMenuItem unmuteItem;
+
         [STAThread]
         static void Main(string[] args)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // Load state from file
             LoadMicState();
 
-            // Set up system tray icon
             trayIcon = new NotifyIcon
             {
                 Icon = isMuted ? new Icon("mic_off.ico") : new Icon("mic_on.ico"),
-                Text = String.Format("MicMute: Microphone is {0}", isMuted ? "off" : "on"),
+                Text = string.Format("MicMute: Microphone is {0}", isMuted ? "off" : "on"),
                 Visible = true
             };
 
-            // Context menu for the tray icon
             ContextMenuStrip menu = new ContextMenuStrip();
-            menu.Items.Add("Mute/Unmute Microphone", null, ToggleMic);
-            menu.Items.Add("Exit", null, (s, e) => Application.Exit());
-            trayIcon.ContextMenuStrip = menu;
 
-            // Double-click on icon toggles microphone
+            muteItem = new ToolStripMenuItem("Mute Microphone");
+            muteItem.Click += SetMicMutedExplicit;
+            menu.Items.Add(muteItem);
+
+            unmuteItem = new ToolStripMenuItem("Unmute Microphone");
+            unmuteItem.Click += SetMicUnmutedExplicit;
+            menu.Items.Add(unmuteItem);
+
+            menu.Items.Add("Exit", null, (s, e) => Application.Exit());
+			
+            menu.Items.Add(new ToolStripSeparator());
+
+            var versionItem = new ToolStripMenuItem(string.Format("MicMute {0} – by rjcncpt", Version));
+            versionItem.Enabled = false;
+            versionItem.Font = new Font(SystemFonts.DefaultFont, FontStyle.Bold);
+            menu.Items.Add(versionItem);
+
+            trayIcon.ContextMenuStrip = menu;
             trayIcon.DoubleClick += ToggleMic;
 
-            // Initialize microphone state
             UpdateTrayIcon();
-
-            // Keep the program running
             Application.Run();
         }
 
         private static void ToggleMic(object sender, EventArgs e)
         {
+            SetMicMuted(!isMuted);
+        }
+
+        private static void SetMicMutedExplicit(object sender, EventArgs e)
+        {
+            SetMicMuted(true);
+        }
+
+        private static void SetMicUnmutedExplicit(object sender, EventArgs e)
+        {
+            SetMicMuted(false);
+        }
+
+        private static void SetMicMuted(bool mute)
+        {
             try
             {
-                IntPtr h = GetForegroundWindow();
-                SendMessageW(h, WM_APPCOMMAND, IntPtr.Zero, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
-                isMuted = !isMuted; // Toggle state (placeholder, later use CoreAudioAPI)
-                UpdateTrayIcon();
-                SaveMicState(); // Save state
+                if (isMuted != mute)
+                {
+                    IntPtr h = GetForegroundWindow();
+                    SendMessageW(h, WM_APPCOMMAND, IntPtr.Zero, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
+                    isMuted = mute;
+                    UpdateTrayIcon();
+                    SaveMicState();
+                }
             }
             catch (Exception ex)
             {
-                trayIcon.ShowBalloonTip(1000, "Error", "Could not toggle microphone: " + ex.Message, ToolTipIcon.Error);
+                trayIcon.ShowBalloonTip(1000, "Error", "Could not change microphone state: " + ex.Message, ToolTipIcon.Error);
             }
         }
 
@@ -83,14 +114,26 @@ namespace MicMute
         {
             try
             {
-                // Set icon and text based on state
                 trayIcon.Icon = isMuted ? new Icon("mic_off.ico") : new Icon("mic_on.ico");
-                trayIcon.Text = String.Format("MicMute: Microphone is {0}", isMuted ? "off" : "on");
+                trayIcon.Text = string.Format("MicMute: Microphone is {0}", isMuted ? "off" : "on");
+                UpdateMenuStatusItems();
             }
             catch (Exception ex)
             {
                 trayIcon.ShowBalloonTip(1000, "Error", "Could not load icon: " + ex.Message, ToolTipIcon.Error);
                 trayIcon.Icon = SystemIcons.Application;
+            }
+        }
+
+        private static void UpdateMenuStatusItems()
+        {
+            if (muteItem != null && unmuteItem != null)
+            {
+                muteItem.Checked = isMuted;
+                unmuteItem.Checked = false;
+
+                unmuteItem.Checked = !isMuted;
+                muteItem.Checked = false;
             }
         }
 
@@ -118,7 +161,7 @@ namespace MicMute
             }
             catch (Exception)
             {
-                isMuted = false; // Fallback to default value
+                isMuted = false;
             }
         }
     }
