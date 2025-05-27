@@ -1,0 +1,41 @@
+name: Create Micmute Release ZIP
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'main/micmute/**'
+  workflow_dispatch:
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create ZIP archive
+        run: |
+          cd main
+          zip -r micmute.zip micmute
+          mv micmute.zip ../
+          cd ..
+
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: micmute-release-${{ steps.date.outputs.date }}
+          name: Micmute Release ${{ steps.date.outputs.date }}
+          draft: false
+          prerelease: false
+          files: micmute.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
