@@ -10,8 +10,8 @@ using System.IO;
 [assembly: AssemblyDescription("Edited by rjcncpt")]
 [assembly: AssemblyInformationalVersion("Edit date: 05/27/2025")]
 
-[assembly: AssemblyCompanyAttribute("AveYo")]
-[assembly: AssemblyVersionAttribute("2019.04.06")]
+[assembly: AssemblyCompanyAttribute("Source: AveYo")]
+[assembly: AssemblyVersionAttribute("04/06/2019")]
 
 namespace MicMute
 {
