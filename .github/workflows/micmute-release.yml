@@ -24,6 +24,12 @@ jobs:
             exit 1
           fi
 
+      - name: Extract version from MicMute.cs
+        id: version
+        run: |
+          VERSION=$(grep 'private const string Version' micmute/MicMute.cs | sed 's/.*Version = "\(.*\)";/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Create ZIP archive
         run: |
           zip -r micmute.zip micmute
@@ -37,7 +43,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: micmute-release-${{ steps.date.outputs.date }}
-          name: Micmute Release ${{ steps.date.outputs.date }}
+          name: MicMute ${{ steps.version.outputs.version }}
           draft: false
           prerelease: false
           files: micmute.zip
