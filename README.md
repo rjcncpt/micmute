@@ -1,9 +1,7 @@
 # MicMute 2
 MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per System-Tray-Icon schnell stummzuschalten oder zu aktivieren. Es zeigt den aktuellen Mikrofonzustand (an/aus) über ein Tray-Icon an und speichert diesen Zustand in einer Konfigurationsdatei. Das Programm ist ideal für Nutzer, die eine einfache Möglichkeit suchen, ihr Mikrofon während Videokonferenzen oder Sprachaufnahmen zu steuern.
 
-![Screenshot 2025-05-27 151811](https://github.com/user-attachments/assets/9c4129f5-d711-47b1-aa6e-6019bd930ed2) ![Screenshot 2025-05-27 151814](https://github.com/user-attachments/assets/ffde982a-b57f-4cb9-a9b9-a955d124b9c0)
-
-
+![mic-on](https://github.com/user-attachments/assets/2082dc3b-5f68-413e-8a16-3f8485d11721) ![mic-off](https://github.com/user-attachments/assets/e2651a60-497f-4d87-9b87-1859d7c008f9)
 
 ## Funktionen
 - System-Tray-Icon: Zeigt an, ob das Mikrofon eingeschaltet oder stummgeschaltet ist.
