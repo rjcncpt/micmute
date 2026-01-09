@@ -8,16 +8,15 @@ using System.IO;
 [assembly: AssemblyTitle("MicMute2")]
 
 [assembly: AssemblyDescription("Edited by rjcncpt")]
-[assembly: AssemblyInformationalVersion("Edit date: 05/27/2025")]
+[assembly: AssemblyInformationalVersion("Edit date: 01/09/2026")]
 
 [assembly: AssemblyCompanyAttribute("Source: AveYo")]
-[assembly: AssemblyVersionAttribute("04/06/2019")]
 
 namespace MicMute
 {
     class Program
     {
-        private const string Version = "v2.0.2";
+        private const string Version = "v2.0.3";
 
         private const int WM_APPCOMMAND = 0x319;
         private const int APPCOMMAND_MICROPHONE_VOLUME_MUTE = 0x180000;
