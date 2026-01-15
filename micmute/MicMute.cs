@@ -7,14 +7,14 @@ using System.IO;
 
 [assembly: AssemblyTitle("MicMute2")]
 [assembly: AssemblyDescription("Edited by rjcncpt")]
-[assembly: AssemblyInformationalVersion("Edit date: 01/09/2026")]
+[assembly: AssemblyInformationalVersion("Edit date: 01/15/2026")]
 [assembly: AssemblyCompanyAttribute("Source: AveYo")]
 
 namespace MicMute
 {
     class Program
     {
-        private const string Version = "v2.0.4";
+        private const string Version = "v2.0.5";
 
         private const int WM_APPCOMMAND = 0x319;
         private const int APPCOMMAND_MICROPHONE_VOLUME_MUTE = 0x180000;
@@ -79,10 +79,22 @@ namespace MicMute
             menu.Items.Add(versionItem);
 
             trayIcon.ContextMenuStrip = menu;
-            trayIcon.DoubleClick += ToggleMic;
+            trayIcon.MouseUp += TrayIcon_MouseUp;
 
             UpdateTrayIcon();
             Application.Run();
+        }
+
+        private static void TrayIcon_MouseUp(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                trayIcon.ContextMenuStrip.Show(Cursor.Position);
+            }
+            else if (e.Button == MouseButtons.Left)
+            {
+                ToggleMic(sender, EventArgs.Empty);
+            }
         }
 
         private static void LoadActualMicState()

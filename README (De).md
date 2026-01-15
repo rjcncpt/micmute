@@ -5,7 +5,7 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 
 ## Funktionen
 - System-Tray-Icon: Zeigt an, ob das Mikrofon eingeschaltet oder stummgeschaltet ist.
-- Ein-Klick-Steuerung: Stummschalten oder Aktivieren des Mikrofons per Doppelklick auf das Tray-Icon oder über das Kontextmenü.
+- Ein-Klick-Steuerung: Stummschalten oder Aktivieren des Mikrofons per Linksklick auf das Tray-Icon oder per Rechtsklick über das Kontextmenü.
 - Automatische Zustandsspeicherung: Der Mikrofonzustand wird in **`MicMuteConfig.txt`** gespeichert und beim Programmstart geladen.
 - Autostart (Optional): Kann über den Windows-Taskplaner oder den Autostart-Ordner beim Anmelden gestartet werden.
 
@@ -32,7 +32,7 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
    - Starte **`MicMute2.exe`** aus **`C:\micmute\`**.
    - Das Tray-Icon erscheint in der Taskleiste und zeigt den Mikrofonzustand an.
    - Der Standard Zustand ist **`False`**, was bedeutet, dass Mikrofon ist eingeschaltet. Vergewissere dich das dein Mikrofon beim ersten Ausführen aktiviert ist.
-   - Ein Doppelklick verändert den Zustand des Icons und speichert diesen in die MicMuteConfig.txt Datei.
+   - Ein Linksklick verändert den Zustand des Icons und speichert diesen in die MicMuteConfig.txt Datei.
   
 ## Hinweise
 - Icons: Stelle sicher, dass mic_on.ico und mic_off.ico im Verzeichnis C:\micmute\ vorhanden sind, da sie für das Tray-Icon benötigt werden.
