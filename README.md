@@ -22,7 +22,7 @@ MicMute is a small Windows utility that allows you to quickly mute or unmute you
 
 ## Features
 - System tray icon: Indicates whether the microphone is enabled or muted.  
-- One-click control: Mute or enable the microphone via double-click on the tray icon or through the context menu.  
+- One-click control: Mute or enable the microphone with a left mouse click on the tray icon or with a right mouse click through the context menu.  
 - Global hotkey: Application-wide control using a configurable key combination.  
 - Default startup state: Option to automatically set the microphone state when the program starts.  
 - Automatic state persistence: Microphone status and settings are stored in a configuration file.
@@ -63,7 +63,7 @@ MicMute is a small Windows utility that allows you to quickly mute or unmute you
   - Right-click the tray icon
   - Select **Settings**
   - Enable **Set microphone to default state on startup** and choose the desired default state.
-- Double-clicking the icon toggles the state and saves it to the **MicMuteConfig.txt** file.
+- Single-left-clicking the icon toggles the state and saves it to the **MicMuteConfig.txt** file.
 
 ---
 
