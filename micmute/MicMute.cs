@@ -4,10 +4,11 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Reflection;
 using System.IO;
+using System.Linq;
 
 [assembly: AssemblyTitle("MicMute2")]
 [assembly: AssemblyDescription("Edited by rjcncpt")]
-[assembly: AssemblyInformationalVersion("Edit date: 02/09/2026")]
+[assembly: AssemblyInformationalVersion("Edit date: 02/10/2026")]
 [assembly: AssemblyCompanyAttribute("Source: AveYo")]
 
 namespace MicMute
@@ -49,6 +50,8 @@ namespace MicMute
         private static bool isMuted = false;
         private static ToolStripMenuItem muteItem;
         private static ToolStripMenuItem unmuteItem;
+        private static ToolStripMenuItem settingsItem;
+        private static ToolStripMenuItem exitItem;
         private static HotkeyMessageWindow hotkeyWindow;
         private static Config config;
 
@@ -71,36 +74,38 @@ namespace MicMute
             trayIcon = new NotifyIcon
             {
                 Icon = isMuted ? new Icon("mic_off.ico") : new Icon("mic_on.ico"),
-                Text = string.Format("MicMute: Microphone is {0}", isMuted ? "off" : "on"),
+                Text = string.Format("MicMute: Microphone is {0}", isMuted ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage)),
                 Visible = true
             };
 
             ContextMenuStrip menu = new ContextMenuStrip();
 
-            muteItem = new ToolStripMenuItem("Mute Microphone");
+            muteItem = new ToolStripMenuItem(Translations.MuteMicrophone(config.AppLanguage));
             muteItem.Click += SetMicMutedExplicit;
             menu.Items.Add(muteItem);
 
-            unmuteItem = new ToolStripMenuItem("Unmute Microphone");
+            unmuteItem = new ToolStripMenuItem(Translations.UnmuteMicrophone(config.AppLanguage));
             unmuteItem.Click += SetMicUnmutedExplicit;
             menu.Items.Add(unmuteItem);
 
             menu.Items.Add(new ToolStripSeparator());
 
-            var settingsItem = new ToolStripMenuItem("Settings");
+            settingsItem = new ToolStripMenuItem(Translations.Settings(config.AppLanguage));
             settingsItem.Click += (s, e) => ShowSettings();
             menu.Items.Add(settingsItem);
 
             menu.Items.Add(new ToolStripSeparator());
 
-            menu.Items.Add("Exit", null, (s, e) => 
+            exitItem = new ToolStripMenuItem(Translations.Exit(config.AppLanguage));
+            exitItem.Click += (s, e) => 
             {
                 if (hotkeyWindow != null)
                 {
                     hotkeyWindow.Close();
                 }
                 Application.Exit();
-            });
+            };
+            menu.Items.Add(exitItem);
             
             menu.Items.Add(new ToolStripSeparator());
 
@@ -110,7 +115,16 @@ namespace MicMute
             menu.Items.Add(versionItem);
 
             trayIcon.ContextMenuStrip = menu;
-            trayIcon.MouseUp += MouseUp;
+            
+            if (config.UseDoubleClick)
+            {
+                trayIcon.MouseDoubleClick += MouseDoubleClick;
+                trayIcon.MouseUp += MouseUpRightClickOnly;
+            }
+            else
+            {
+                trayIcon.MouseUp += MouseUp;
+            }
 
             UpdateTrayIcon();
 
@@ -132,6 +146,22 @@ namespace MicMute
             }
         }
 
+        private static void MouseUpRightClickOnly(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                trayIcon.ContextMenuStrip.Show(Cursor.Position);
+            }
+        }
+
+        private static void MouseDoubleClick(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                ToggleMic(sender, EventArgs.Empty);
+            }
+        }
+
         private static void ShowSettings()
         {
             using (SettingsForm settingsForm = new SettingsForm(config))
@@ -139,8 +169,37 @@ namespace MicMute
                 if (settingsForm.ShowDialog() == DialogResult.OK)
                 {
                     UnregisterHotKey(hotkeyWindow.Handle, HOTKEY_ID);
+                    
+                    bool previousDoubleClickSetting = config.UseDoubleClick;
+                    Language previousLanguage = config.AppLanguage;
                     config = settingsForm.GetConfig();
                     config.Save();
+                    
+                    if (previousDoubleClickSetting != config.UseDoubleClick)
+                    {
+                        if (config.UseDoubleClick)
+                        {
+                            trayIcon.MouseUp -= MouseUp;
+                            trayIcon.MouseDoubleClick += MouseDoubleClick;
+                            trayIcon.MouseUp += MouseUpRightClickOnly;
+                        }
+                        else
+                        {
+                            trayIcon.MouseDoubleClick -= MouseDoubleClick;
+                            trayIcon.MouseUp -= MouseUpRightClickOnly;
+                            trayIcon.MouseUp += MouseUp;
+                        }
+                    }
+
+                    if (previousLanguage != config.AppLanguage)
+                    {
+                        muteItem.Text = Translations.MuteMicrophone(config.AppLanguage);
+                        unmuteItem.Text = Translations.UnmuteMicrophone(config.AppLanguage);
+                        settingsItem.Text = Translations.Settings(config.AppLanguage);
+                        exitItem.Text = Translations.Exit(config.AppLanguage);
+                        UpdateTrayIcon();
+                    }
+                    
                     RegisterGlobalHotkey();
                 }
             }
@@ -238,6 +297,67 @@ namespace MicMute
             }
         }
 
+        private static void LoadMicStateFromFile()
+        {
+            if (File.Exists(configFile))
+            {
+                try
+                {
+                    string content = File.ReadAllText(configFile);
+                    if (content.Contains("MUTED="))
+                    {
+                        string mutedLine = content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                            .FirstOrDefault(l => l.StartsWith("MUTED="));
+                        if (mutedLine != null)
+                        {
+                            isMuted = mutedLine.Split('=')[1].Trim().ToUpper() == "TRUE";
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    isMuted = false;
+                }
+            }
+        }
+
+        private static void SaveMicStateToFile()
+        {
+            try
+            {
+                string existingContent = "";
+                if (File.Exists(configFile))
+                {
+                    existingContent = File.ReadAllText(configFile);
+                }
+
+                string[] lines = existingContent.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                bool mutedLineFound = false;
+                
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    if (lines[i].StartsWith("MUTED="))
+                    {
+                        lines[i] = "MUTED=" + isMuted.ToString().ToUpper();
+                        mutedLineFound = true;
+                        break;
+                    }
+                }
+
+                if (mutedLineFound)
+                {
+                    File.WriteAllText(configFile, string.Join(Environment.NewLine, lines));
+                }
+                else
+                {
+                    File.AppendAllText(configFile, Environment.NewLine + "MUTED=" + isMuted.ToString().ToUpper());
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         private struct IMMDeviceEnumeratorVtbl
         {
@@ -245,10 +365,10 @@ namespace MicMute
             public IntPtr AddRef;
             public IntPtr Release;
             public GetDefaultAudioEndpointDelegate GetDefaultAudioEndpoint;
-        }
 
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate int GetDefaultAudioEndpointDelegate(IntPtr self, int dataFlow, int role, out IntPtr device);
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int GetDefaultAudioEndpointDelegate(IntPtr This, int dataFlow, int role, out IntPtr ppDevice);
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct IMMDeviceVtbl
@@ -257,10 +377,13 @@ namespace MicMute
             public IntPtr AddRef;
             public IntPtr Release;
             public ActivateDelegate Activate;
-        }
+            public IntPtr OpenPropertyStore;
+            public IntPtr GetId;
+            public IntPtr GetState;
 
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate int ActivateDelegate(IntPtr self, ref Guid iid, int clsCtx, IntPtr activationParams, out IntPtr interfacePtr);
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int ActivateDelegate(IntPtr This, ref Guid iid, int dwClsCtx, IntPtr pActivationParams, out IntPtr ppInterface);
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct IAudioEndpointVolumeVtbl
@@ -279,66 +402,43 @@ namespace MicMute
             public IntPtr SetChannelVolumeLevelScalar;
             public IntPtr GetChannelVolumeLevel;
             public IntPtr GetChannelVolumeLevelScalar;
-            public IntPtr SetMute;
+            public SetMuteDelegate SetMute;
             public GetMuteDelegate GetMute;
-        }
 
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate int GetMuteDelegate(IntPtr self, out int muted);
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int SetMuteDelegate(IntPtr This, int bMute, ref Guid pguidEventContext);
 
-        private static void LoadMicStateFromFile()
-        {
-            try
-            {
-                if (File.Exists(configFile))
-                {
-                    string state = File.ReadAllText(configFile).Trim();
-                    isMuted = bool.Parse(state);
-                }
-            }
-            catch (Exception)
-            {
-                isMuted = false;
-            }
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int GetMuteDelegate(IntPtr This, out int pbMute);
         }
 
         private static void ToggleMic(object sender, EventArgs e)
         {
-            SetMicMuted(!isMuted);
-        }
-
-        public static void OnHotkeyPressed()
-        {
-            SetMicMuted(!isMuted);
+            isMuted = !isMuted;
+            SetMicMuted(isMuted);
         }
 
         private static void SetMicMutedExplicit(object sender, EventArgs e)
         {
+            isMuted = true;
             SetMicMuted(true);
         }
 
         private static void SetMicUnmutedExplicit(object sender, EventArgs e)
         {
+            isMuted = false;
             SetMicMuted(false);
         }
 
-        private static void SetMicMuted(bool mute)
+        private static void SetMicMuted(bool muted)
         {
-            try
-            {
-                if (isMuted != mute)
-                {
-                    IntPtr h = GetForegroundWindow();
-                    SendMessageW(h, WM_APPCOMMAND, IntPtr.Zero, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
-                    isMuted = mute;
-                    UpdateTrayIcon();
-                    SaveMicState();
-                }
-            }
-            catch (Exception ex)
-            {
-                trayIcon.ShowBalloonTip(1000, "Error", "Could not change microphone state: " + ex.Message, ToolTipIcon.Error);
-            }
+            isMuted = muted;
+            
+            IntPtr hwnd = GetForegroundWindow();
+            SendMessageW(hwnd, WM_APPCOMMAND, hwnd, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
+            
+            UpdateTrayIcon();
+            SaveMicStateToFile();
         }
 
         private static void UpdateTrayIcon()
@@ -346,98 +446,238 @@ namespace MicMute
             try
             {
                 trayIcon.Icon = isMuted ? new Icon("mic_off.ico") : new Icon("mic_on.ico");
-                trayIcon.Text = string.Format("MicMute: Microphone is {0}", isMuted ? "off" : "on");
-                UpdateMenuStatusItems();
+                trayIcon.Text = string.Format("MicMute: Microphone is {0}", isMuted ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage));
+
+                muteItem.Visible = !isMuted;
+                unmuteItem.Visible = isMuted;
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                trayIcon.ShowBalloonTip(1000, "Error", "Could not load icon: " + ex.Message, ToolTipIcon.Error);
-                trayIcon.Icon = SystemIcons.Application;
             }
         }
 
-        private static void UpdateMenuStatusItems()
+        private class HotkeyMessageWindow : Form
         {
-            if (muteItem != null && unmuteItem != null)
+            protected override void WndProc(ref Message m)
             {
-                muteItem.Checked = isMuted;
-                unmuteItem.Checked = !isMuted;
+                if (m.Msg == WM_HOTKEY)
+                {
+                    ToggleMic(null, EventArgs.Empty);
+                }
+                base.WndProc(ref m);
             }
         }
+    }
 
-        private static void SaveMicState()
+    public enum Language
+    {
+        English,
+        German
+    }
+
+    public static class Translations
+    {
+        public static string MicrophoneOn(Language lang)
         {
-            try
-            {
-                File.WriteAllText(configFile, isMuted.ToString());
-            }
-            catch (Exception ex)
-            {
-                trayIcon.ShowBalloonTip(1000, "Error", "Could not save state: " + ex.Message, ToolTipIcon.Error);
-            }
+            return lang == Language.German ? "an" : "on";
+        }
+
+        public static string MicrophoneOff(Language lang)
+        {
+            return lang == Language.German ? "aus" : "off";
+        }
+
+        public static string MuteMicrophone(Language lang)
+        {
+            return lang == Language.German ? "Mikrofon stummschalten" : "Mute Microphone";
+        }
+
+        public static string UnmuteMicrophone(Language lang)
+        {
+            return lang == Language.German ? "Mikrofon aktivieren" : "Unmute Microphone";
+        }
+
+        public static string Settings(Language lang)
+        {
+            return lang == Language.German ? "Einstellungen" : "Settings";
+        }
+
+        public static string Exit(Language lang)
+        {
+            return lang == Language.German ? "Beenden" : "Exit";
+        }
+
+        public static string SettingsTitle(Language lang)
+        {
+            return lang == Language.German ? "MicMute Einstellungen" : "MicMute Settings";
+        }
+
+        public static string GlobalHotkey(Language lang)
+        {
+            return lang == Language.German ? "Globaler Hotkey" : "Global Hotkey";
+        }
+
+        public static string EnableGlobalHotkey(Language lang)
+        {
+            return lang == Language.German ? "Globalen Hotkey aktivieren" : "Enable global hotkey";
+        }
+
+        public static string Hotkey(Language lang)
+        {
+            return lang == Language.German ? "Hotkey:" : "Hotkey:";
+        }
+
+        public static string HotkeyInfo(Language lang)
+        {
+            return lang == Language.German ? "Klicken Sie in das Feld und drücken Sie die gewünschte Tastenkombination" : "Click in the field and press your desired key combination";
+        }
+
+        public static string HotkeyDisabled(Language lang)
+        {
+            return lang == Language.German ? "Hotkey deaktiviert" : "Hotkey disabled";
+        }
+
+        public static string ClickHerePress(Language lang)
+        {
+            return lang == Language.German ? "Hier klicken und Tastenkombination drücken..." : "Click here and press a key combination...";
+        }
+
+        public static string TrayIconClickBehavior(Language lang)
+        {
+            return lang == Language.German ? "Tray-Icon Klick-Verhalten" : "Tray Icon Click Behavior";
+        }
+
+        public static string SingleClickToggle(Language lang)
+        {
+            return lang == Language.German ? "Einfachklick zum Umschalten des Mikrofons" : "Single click to toggle microphone";
+        }
+
+        public static string DoubleClickToggle(Language lang)
+        {
+            return lang == Language.German ? "Doppelklick zum Umschalten des Mikrofons" : "Double click to toggle microphone";
+        }
+
+        public static string DefaultMicrophoneState(Language lang)
+        {
+            return lang == Language.German ? "Standard-Mikrofonstatus" : "Default Microphone State";
+        }
+
+        public static string SetMicrophoneDefaultState(Language lang)
+        {
+            return lang == Language.German ? "Mikrofon beim Start auf Standardstatus setzen" : "Set microphone to default state on startup";
+        }
+
+        public static string MutedMicrophoneOff(Language lang)
+        {
+            return lang == Language.German ? "Stumm (Mikrofon aus)" : "Muted (microphone off)";
+        }
+
+        public static string UnmutedMicrophoneOn(Language lang)
+        {
+            return lang == Language.German ? "Aktiv (Mikrofon an)" : "Unmuted (microphone on)";
+        }
+
+        public static string LanguageSettings(Language lang)
+        {
+            return lang == Language.German ? "Sprache" : "Language";
+        }
+
+        public static string English(Language lang)
+        {
+            return lang == Language.German ? "Englisch" : "English";
+        }
+
+        public static string German(Language lang)
+        {
+            return lang == Language.German ? "Deutsch" : "German";
         }
     }
 
     public class Config
     {
-        private static readonly string configPath = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "MicMuteSettings.cfg");
-
         public bool HotkeyEnabled { get; set; }
         public Keys HotkeyKey { get; set; }
         public Keys HotkeyModifiers { get; set; }
         public bool UseDefaultState { get; set; }
         public bool DefaultMutedState { get; set; }
+        public bool UseDoubleClick { get; set; }
+        public Language AppLanguage { get; set; }
+
+        private static readonly string configFile = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "MicMuteConfig.txt");
 
         public Config()
         {
-            HotkeyEnabled = false;
-            HotkeyKey = Keys.M;
-            HotkeyModifiers = Keys.Control | Keys.Shift;
+            HotkeyEnabled = true;
+            HotkeyKey = Keys.F13;
+            HotkeyModifiers = Keys.None;
             UseDefaultState = false;
-            DefaultMutedState = false;
+            DefaultMutedState = true;
+            UseDoubleClick = false;
+            AppLanguage = Language.English;
         }
 
         public static Config Load()
         {
             Config config = new Config();
+
+            if (!File.Exists(configFile))
+            {
+                return config;
+            }
+
             try
             {
-                if (File.Exists(configPath))
+                string[] lines = File.ReadAllLines(configFile);
+                foreach (string line in lines)
                 {
-                    string[] lines = File.ReadAllLines(configPath);
-                    foreach (string line in lines)
+                    if (line.StartsWith("HOTKEY_ENABLED="))
                     {
-                        string[] parts = line.Split('=');
-                        if (parts.Length == 2)
-                        {
-                            string key = parts[0].Trim();
-                            string value = parts[1].Trim();
-
-                            switch (key)
-                            {
-                                case "HotkeyEnabled":
-                                    config.HotkeyEnabled = bool.Parse(value);
-                                    break;
-                                case "HotkeyKey":
-                                    config.HotkeyKey = (Keys)Enum.Parse(typeof(Keys), value);
-                                    break;
-                                case "HotkeyModifiers":
-                                    config.HotkeyModifiers = (Keys)Enum.Parse(typeof(Keys), value);
-                                    break;
-                                case "UseDefaultState":
-                                    config.UseDefaultState = bool.Parse(value);
-                                    break;
-                                case "DefaultMutedState":
-                                    config.DefaultMutedState = bool.Parse(value);
-                                    break;
-                            }
-                        }
+                        bool enabled;
+                        bool.TryParse(line.Substring(15), out enabled);
+                        config.HotkeyEnabled = enabled;
+                    }
+                    else if (line.StartsWith("HOTKEY_KEY="))
+                    {
+                        Keys key;
+                        Enum.TryParse(line.Substring(11), out key);
+                        config.HotkeyKey = key;
+                    }
+                    else if (line.StartsWith("HOTKEY_MODIFIERS="))
+                    {
+                        Keys modifiers;
+                        Enum.TryParse(line.Substring(17), out modifiers);
+                        config.HotkeyModifiers = modifiers;
+                    }
+                    else if (line.StartsWith("USE_DEFAULT_STATE="))
+                    {
+                        bool useDefault;
+                        bool.TryParse(line.Substring(18), out useDefault);
+                        config.UseDefaultState = useDefault;
+                    }
+                    else if (line.StartsWith("DEFAULT_MUTED_STATE="))
+                    {
+                        bool defaultMuted;
+                        bool.TryParse(line.Substring(20), out defaultMuted);
+                        config.DefaultMutedState = defaultMuted;
+                    }
+                    else if (line.StartsWith("USE_DOUBLE_CLICK="))
+                    {
+                        bool useDoubleClick;
+                        bool.TryParse(line.Substring(17), out useDoubleClick);
+                        config.UseDoubleClick = useDoubleClick;
+                    }
+                    else if (line.StartsWith("LANGUAGE="))
+                    {
+                        Language language;
+                        Enum.TryParse(line.Substring(9), out language);
+                        config.AppLanguage = language;
                     }
                 }
             }
             catch (Exception)
             {
             }
+
             return config;
         }
 
@@ -445,15 +685,35 @@ namespace MicMute
         {
             try
             {
-                string[] lines = new string[]
+                string content = string.Format(
+                    "HOTKEY_ENABLED={0}{1}HOTKEY_KEY={2}{1}HOTKEY_MODIFIERS={3}{1}USE_DEFAULT_STATE={4}{1}DEFAULT_MUTED_STATE={5}{1}USE_DOUBLE_CLICK={6}{1}LANGUAGE={7}",
+                    HotkeyEnabled,
+                    Environment.NewLine,
+                    HotkeyKey,
+                    HotkeyModifiers,
+                    UseDefaultState,
+                    DefaultMutedState,
+                    UseDoubleClick,
+                    AppLanguage
+                );
+
+                string existingContent = "";
+                if (File.Exists(configFile))
                 {
-                    "HotkeyEnabled=" + HotkeyEnabled,
-                    "HotkeyKey=" + HotkeyKey,
-                    "HotkeyModifiers=" + HotkeyModifiers,
-                    "UseDefaultState=" + UseDefaultState,
-                    "DefaultMutedState=" + DefaultMutedState
-                };
-                File.WriteAllLines(configPath, lines);
+                    existingContent = File.ReadAllText(configFile);
+                }
+
+                if (existingContent.Contains("MUTED="))
+                {
+                    string[] lines = existingContent.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    string mutedLine = lines.FirstOrDefault(l => l.StartsWith("MUTED="));
+                    if (mutedLine != null)
+                    {
+                        content += Environment.NewLine + mutedLine;
+                    }
+                }
+
+                File.WriteAllText(configFile, content);
             }
             catch (Exception)
             {
@@ -461,36 +721,23 @@ namespace MicMute
         }
     }
 
-    public class HotkeyMessageWindow : Form
-    {
-        public HotkeyMessageWindow()
-        {
-            this.ShowInTaskbar = false;
-            this.FormBorderStyle = FormBorderStyle.None;
-            this.WindowState = FormWindowState.Minimized;
-            this.Size = new Size(0, 0);
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            const int WM_HOTKEY = 0x0312;
-            if (m.Msg == WM_HOTKEY)
-            {
-                Program.OnHotkeyPressed();
-            }
-            base.WndProc(ref m);
-        }
-    }
-
     public class SettingsForm : Form
     {
         private CheckBox chkEnableHotkey;
         private TextBox txtHotkey;
+        private Label lblHotkey;
         private Label lblHotkeyInfo;
         private CheckBox chkUseDefaultState;
         private RadioButton rbDefaultMuted;
         private RadioButton rbDefaultUnmuted;
         private GroupBox grpDefaultState;
+        private RadioButton rbSingleClick;
+        private RadioButton rbDoubleClick;
+        private GroupBox grpClickBehavior;
+        private RadioButton rbEnglish;
+        private RadioButton rbGerman;
+        private GroupBox grpLanguage;
+        private GroupBox grpHotkey;
         private Button btnOK;
         private Button btnCancel;
         private Config config;
@@ -505,7 +752,9 @@ namespace MicMute
                 HotkeyKey = cfg.HotkeyKey,
                 HotkeyModifiers = cfg.HotkeyModifiers,
                 UseDefaultState = cfg.UseDefaultState,
-                DefaultMutedState = cfg.DefaultMutedState
+                DefaultMutedState = cfg.DefaultMutedState,
+                UseDoubleClick = cfg.UseDoubleClick,
+                AppLanguage = cfg.AppLanguage
             };
 
             currentKey = config.HotkeyKey;
@@ -516,25 +765,25 @@ namespace MicMute
 
         private void InitializeComponents()
         {
-            this.Text = "MicMute Settings";
-            this.Size = new Size(450, 340);
+            this.Text = Translations.SettingsTitle(config.AppLanguage);
+            this.Size = new Size(450, 520);
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
 
-            GroupBox grpHotkey = new GroupBox
+            grpHotkey = new GroupBox
             {
-                Text = "Global Hotkey",
+                Text = Translations.GlobalHotkey(config.AppLanguage),
                 Location = new Point(15, 15),
                 Size = new Size(405, 130)
             };
 
             chkEnableHotkey = new CheckBox
             {
-                Text = "Enable global hotkey",
+                Text = Translations.EnableGlobalHotkey(config.AppLanguage),
                 Location = new Point(15, 25),
-                Size = new Size(200, 20),
+                Size = new Size(300, 20),
                 Checked = config.HotkeyEnabled
             };
             chkEnableHotkey.CheckedChanged += (s, e) => 
@@ -543,9 +792,9 @@ namespace MicMute
                 UpdateHotkeyDisplay();
             };
 
-            Label lblHotkey = new Label
+            lblHotkey = new Label
             {
-                Text = "Hotkey:",
+                Text = Translations.Hotkey(config.AppLanguage),
                 Location = new Point(15, 55),
                 Size = new Size(60, 20)
             };
@@ -562,7 +811,7 @@ namespace MicMute
 
             lblHotkeyInfo = new Label
             {
-                Text = "Click in the field and press your desired key combination",
+                Text = Translations.HotkeyInfo(config.AppLanguage),
                 Location = new Point(15, 85),
                 Size = new Size(370, 35),
                 ForeColor = Color.Gray
@@ -573,18 +822,73 @@ namespace MicMute
             grpHotkey.Controls.Add(txtHotkey);
             grpHotkey.Controls.Add(lblHotkeyInfo);
 
+            grpClickBehavior = new GroupBox
+            {
+                Text = Translations.TrayIconClickBehavior(config.AppLanguage),
+                Location = new Point(15, 155),
+                Size = new Size(405, 70)
+            };
+
+            rbSingleClick = new RadioButton
+            {
+                Text = Translations.SingleClickToggle(config.AppLanguage),
+                Location = new Point(15, 25),
+                Size = new Size(370, 20),
+                Checked = !config.UseDoubleClick
+            };
+
+            rbDoubleClick = new RadioButton
+            {
+                Text = Translations.DoubleClickToggle(config.AppLanguage),
+                Location = new Point(15, 45),
+                Size = new Size(370, 20),
+                Checked = config.UseDoubleClick
+            };
+
+            grpClickBehavior.Controls.Add(rbSingleClick);
+            grpClickBehavior.Controls.Add(rbDoubleClick);
+
+            grpLanguage = new GroupBox
+            {
+                Text = Translations.LanguageSettings(config.AppLanguage),
+                Location = new Point(15, 235),
+                Size = new Size(405, 70)
+            };
+
+            rbEnglish = new RadioButton
+            {
+                Text = Translations.English(config.AppLanguage),
+                Location = new Point(15, 25),
+                Size = new Size(180, 20),
+                Checked = config.AppLanguage == Language.English
+            };
+
+            rbGerman = new RadioButton
+            {
+                Text = Translations.German(config.AppLanguage),
+                Location = new Point(15, 45),
+                Size = new Size(180, 20),
+                Checked = config.AppLanguage == Language.German
+            };
+
+            rbEnglish.CheckedChanged += (s, e) => { if (rbEnglish.Checked) UpdateLanguage(Language.English); };
+            rbGerman.CheckedChanged += (s, e) => { if (rbGerman.Checked) UpdateLanguage(Language.German); };
+
+            grpLanguage.Controls.Add(rbEnglish);
+            grpLanguage.Controls.Add(rbGerman);
+
             grpDefaultState = new GroupBox
             {
-                Text = "Default Microphone State",
-                Location = new Point(15, 155),
+                Text = Translations.DefaultMicrophoneState(config.AppLanguage),
+                Location = new Point(15, 315),
                 Size = new Size(405, 100)
             };
 
             chkUseDefaultState = new CheckBox
             {
-                Text = "Set microphone to default state on startup",
+                Text = Translations.SetMicrophoneDefaultState(config.AppLanguage),
                 Location = new Point(15, 25),
-                Size = new Size(300, 20),
+                Size = new Size(370, 20),
                 Checked = config.UseDefaultState
             };
             chkUseDefaultState.CheckedChanged += (s, e) =>
@@ -595,7 +899,7 @@ namespace MicMute
 
             rbDefaultMuted = new RadioButton
             {
-                Text = "Muted (microphone off)",
+                Text = Translations.MutedMicrophoneOff(config.AppLanguage),
                 Location = new Point(35, 55),
                 Size = new Size(200, 20),
                 Checked = config.DefaultMutedState,
@@ -604,7 +908,7 @@ namespace MicMute
 
             rbDefaultUnmuted = new RadioButton
             {
-                Text = "Unmuted (microphone on)",
+                Text = Translations.UnmutedMicrophoneOn(config.AppLanguage),
                 Location = new Point(235, 55),
                 Size = new Size(200, 20),
                 Checked = !config.DefaultMutedState,
@@ -619,7 +923,7 @@ namespace MicMute
             {
                 Text = "OK",
                 DialogResult = DialogResult.OK,
-                Location = new Point(250, 270),
+                Location = new Point(250, 430),
                 Size = new Size(80, 30)
             };
             btnOK.Click += BtnOK_Click;
@@ -628,16 +932,45 @@ namespace MicMute
             {
                 Text = "Cancel",
                 DialogResult = DialogResult.Cancel,
-                Location = new Point(340, 270),
+                Location = new Point(340, 430),
                 Size = new Size(80, 30)
             };
 
             this.Controls.Add(grpHotkey);
+            this.Controls.Add(grpClickBehavior);
+            this.Controls.Add(grpLanguage);
             this.Controls.Add(grpDefaultState);
             this.Controls.Add(btnOK);
             this.Controls.Add(btnCancel);
             this.AcceptButton = btnOK;
             this.CancelButton = btnCancel;
+
+            UpdateHotkeyDisplay();
+        }
+
+        private void UpdateLanguage(Language newLanguage)
+        {
+            config.AppLanguage = newLanguage;
+
+            this.Text = Translations.SettingsTitle(newLanguage);
+            
+            grpHotkey.Text = Translations.GlobalHotkey(newLanguage);
+            chkEnableHotkey.Text = Translations.EnableGlobalHotkey(newLanguage);
+            lblHotkey.Text = Translations.Hotkey(newLanguage);
+            lblHotkeyInfo.Text = Translations.HotkeyInfo(newLanguage);
+
+            grpClickBehavior.Text = Translations.TrayIconClickBehavior(newLanguage);
+            rbSingleClick.Text = Translations.SingleClickToggle(newLanguage);
+            rbDoubleClick.Text = Translations.DoubleClickToggle(newLanguage);
+
+            grpLanguage.Text = Translations.LanguageSettings(newLanguage);
+            rbEnglish.Text = Translations.English(newLanguage);
+            rbGerman.Text = Translations.German(newLanguage);
+
+            grpDefaultState.Text = Translations.DefaultMicrophoneState(newLanguage);
+            chkUseDefaultState.Text = Translations.SetMicrophoneDefaultState(newLanguage);
+            rbDefaultMuted.Text = Translations.MutedMicrophoneOff(newLanguage);
+            rbDefaultUnmuted.Text = Translations.UnmutedMicrophoneOn(newLanguage);
 
             UpdateHotkeyDisplay();
         }
@@ -684,13 +1017,13 @@ namespace MicMute
         {
             if (!chkEnableHotkey.Checked)
             {
-                txtHotkey.Text = "Hotkey disabled";
+                txtHotkey.Text = Translations.HotkeyDisabled(config.AppLanguage);
                 return;
             }
 
             if (currentKey == Keys.None)
             {
-                txtHotkey.Text = "Click here and press a key combination...";
+                txtHotkey.Text = Translations.ClickHerePress(config.AppLanguage);
                 return;
             }
 
@@ -713,6 +1046,8 @@ namespace MicMute
             config.HotkeyModifiers = currentModifiers;
             config.UseDefaultState = chkUseDefaultState.Checked;
             config.DefaultMutedState = rbDefaultMuted.Checked;
+            config.UseDoubleClick = rbDoubleClick.Checked;
+            config.AppLanguage = rbGerman.Checked ? Language.German : Language.English;
         }
 
         public Config GetConfig()
