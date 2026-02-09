@@ -1,18 +1,35 @@
 # MicMute 2
-MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per System-Tray-Icon schnell stummzuschalten oder zu aktivieren. Es zeigt den aktuellen Mikrofonzustand (an/aus) über ein Tray-Icon an und speichert diesen Zustand in einer Konfigurationsdatei. Das Programm ist ideal für Nutzer, die eine einfache Möglichkeit suchen, ihr Mikrofon während Videokonferenzen oder Sprachaufnahmen zu steuern.
+
+**Version:** v2.1.0  
+**Letzte Änderung:** 09.02.2026  
+**Autoren:** 
+- AveYo (Original, nicht mehr auf Github verfügbar)
+- rjcncpt (Verbesserungen). 
+
+MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per System-Tray-Icon schnell stummzuschalten oder zu aktivieren. Es zeigt den aktuellen Mikrofonzustand (an/aus) über ein Tray-Icon an und speichert diesen Zustand in einer Konfigurationsdatei.
 
 ![mic-on-off](https://github.com/user-attachments/assets/5277a8af-3598-4b3c-a46c-df598fce5b6c)
 
+---
+
+## Neu in v2.1.0 (Wichtigste Änderungen)
+- **Globaler, benutzerdefinierter Hotkey**: Lege einen Hotkey direkt in den Einstellungen fest (z. B. `Ctrl+Shift+M`).
+- **Einstellungsdialog (Settings)**: UI zur Konfiguration des Hotkeys und zur Auswahl eines Default-Startzustands (Muted / Unmuted).
+- Beta: **Systemstatus-Erkennung beim Start**: Das Programm nutzt die Windows Core Audio API, um den aktuellen Mikrofonstatus beim Start zu bestimmen und das Tray-Icon korrekt zu setzen; es gibt einen Fallback auf gespeicherte Einstellungen.
+
+---
+
 ## Funktionen
-- System-Tray-Icon: Zeigt an, ob das Mikrofon eingeschaltet oder stummgeschaltet ist.
-- Ein-Klick-Steuerung: Stummschalten oder Aktivieren des Mikrofons per Doppelklick auf das Tray-Icon oder über das Kontextmenü.
-- Automatische Zustandsspeicherung: Der Mikrofonzustand wird in **`MicMuteConfig.txt`** gespeichert und beim Programmstart geladen.
-- Autostart (Optional): Kann über den Windows-Taskplaner oder den Autostart-Ordner beim Anmelden gestartet werden.
+- System-Tray-Icon: Zeigt an, ob das Mikrofon eingeschaltet oder stummgeschaltet ist.  
+- Ein-Klick-Steuerung: Stummschalten oder Aktivieren des Mikrofons per Doppelklick auf das Tray-Icon oder über das Kontextmenü.  
+- Globaler Hotkey: Programmweit über eine definierbare Tastenkombination.
+- Default-State beim Start: Option zum automatischen Setzen des Mikrofonzustandes beim Programmstart.
+- Automatische Zustandsspeicherung: Der Mikrofonzustand und Einstellungen werden in einer Konfigurationsdatei gespeichert. 
 
 ## Voraussetzungen
-- Windows-Betriebssystem (getestet mit Windows 10/11).
+- Windows (getestet unter Windows 10/11; kompatibel ab Windows Vista).
 - .NET Framework 4.0 oder höher.
-- Zwei Icon-Dateien: **`mic_on.ico`** und **`mic_off.ico`** (müssen im gleichen Verzeichnis wie die ausführbare Datei liegen).
+- Zwei Icon-Dateien: `mic_on.ico` und `mic_off.ico` (müssen im gleichen Verzeichnis wie die ausführbare Datei liegen).
 
 ## Installation
 1. **Download:**
@@ -31,7 +48,10 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 5. **Ausführen:**
    - Starte **`MicMute2.exe`** aus **`C:\micmute\`**.
    - Das Tray-Icon erscheint in der Taskleiste und zeigt den Mikrofonzustand an.
-   - Der Standard Zustand ist **`False`**, was bedeutet, dass Mikrofon ist eingeschaltet. Vergewissere dich das dein Mikrofon beim ersten Ausführen aktiviert ist.
+   - Wird der Zustand nicht korrekt angezeigt, zum Beispiel gründes Icon aber das Mikrofon ist ausgeschaltet:
+     - Klicke mit der rechten Maustaste auf das Tray-Icon
+     - Wähle "Settings"
+     - Setze einen Haken bei "Set microphone to default state on Startup" und wähle den Standardwert aus.
    - Ein Doppelklick verändert den Zustand des Icons und speichert diesen in die MicMuteConfig.txt Datei.
   
 ## Hinweise
@@ -40,7 +60,3 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 
 ## Lizenz
 Dieses Projekt steht unter der GPL-3.0 Lizenz. Du kannst den Code frei verwenden, modifizieren und verteilen, solange die Lizenzbedingungen eingehalten werden.
-
-## Autoren
-AveYo: Originalentwickler (06.04.2019)<br>
-rjcncpt: Bearbeiter (Stand: 27.05.2025)
