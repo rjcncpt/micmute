@@ -13,7 +13,7 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("MicMute2")]
 [assembly: AssemblyDescription("Edited by rjcncpt")]
 [assembly: AssemblyInformationalVersion("Edit date: 02/10/2026")]
-[assembly: AssemblyCompanyAttribute("Source: AveYo")]
+[assembly: AssemblyCompanyAttribute("Source: rjcncpt")]
 
 namespace MicMute
 {
@@ -198,15 +198,20 @@ namespace MicMute
 
         private static void LoadIcons()
         {
+            // Fix: Get the directory where the .exe is located
+            string appDir = Path.GetDirectoryName(Application.ExecutablePath);
+            string mutedPath = Path.Combine(appDir, "mic_off.ico");
+            string unmutedPath = Path.Combine(appDir, "mic_on.ico");
+
             try 
             {
-                iconMuted = File.Exists("mic_off.ico") ? new Icon("mic_off.ico") : SystemIcons.Shield;
+                iconMuted = File.Exists(mutedPath) ? new Icon(mutedPath) : SystemIcons.Shield;
             }
             catch { iconMuted = SystemIcons.Shield; }
 
             try
             {
-                iconUnmuted = File.Exists("mic_on.ico") ? new Icon("mic_on.ico") : SystemIcons.Information;
+                iconUnmuted = File.Exists(unmutedPath) ? new Icon(unmutedPath) : SystemIcons.Information;
             }
             catch { iconUnmuted = SystemIcons.Information; }
         }
@@ -260,7 +265,7 @@ namespace MicMute
             
             menu.Items.Add(new ToolStripSeparator());
 
-            var versionItem = new ToolStripMenuItem(string.Format("MicMute {0}", Version));
+            var versionItem = new ToolStripMenuItem(string.Format("MicMute {0} – by rjcncpt", Version));
             versionItem.Enabled = false;
             versionItem.Font = new Font(SystemFonts.DefaultFont, FontStyle.Bold);
             menu.Items.Add(versionItem);
@@ -1236,6 +1241,7 @@ namespace MicMute
         private CheckBox chkEnablePushToTalk;
         private TextBox txtPushToTalkHotkey;
         private Label lblPushToTalkHotkey;
+		private Label lblPushToTalkDesc;
         private CheckBox chkShowToastOnToggle;
         private CheckBox chkShowToastOnMute;
         private CheckBox chkShowToastOnUnmute;
@@ -1619,7 +1625,7 @@ namespace MicMute
             txtPushToTalkHotkey.KeyDown += TxtHotkey_KeyDown;
             txtPushToTalkHotkey.PreviewKeyDown += TxtHotkey_PreviewKeyDown;
 
-            Label lblPushToTalkDesc = new Label
+            lblPushToTalkDesc = new Label
             {
                 Text = Translations.PushToTalkDescription(config.AppLanguage),
                 Location = new Point(15, 85),
@@ -1786,6 +1792,7 @@ namespace MicMute
             grpPushToTalk.Text = Translations.PushToTalk(newLanguage);
             chkEnablePushToTalk.Text = Translations.EnableHotkey(newLanguage);
             lblPushToTalkHotkey.Text = Translations.Hotkey(newLanguage);
+			lblPushToTalkDesc.Text = Translations.PushToTalkDescription(newLanguage);
             
             grpNotifications.Text = Translations.ToastNotifications(newLanguage);
             chkShowToastOnToggle.Text = Translations.ShowToastOnToggle(newLanguage);
