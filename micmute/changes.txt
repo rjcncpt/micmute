@@ -1,0 +1,150 @@
+# Changelog
+
+## [v2.3.0] - 2026-07-30
+
+### Fixed
+- **COM interface layout**: `IMMDeviceEnumeratorVtbl` was missing the `EnumAudioEndpoints`
+  slot, so every `GetDefaultAudioEndpoint` call actually invoked `EnumAudioEndpoints` and
+  failed with `E_INVALIDARG` (0x80070057). `GetSystemMicrophoneMuteState()` therefore
+  always returned null and the real microphone state was never read.
+- **`SetMicMuted()` toggled instead of setting**: because the state read above always
+  failed, every call fell through to the `WM_APPCOMMAND` toggle. "Mute microphone" on an
+  already muted microphone unmuted it. Now uses `IAudioEndpointVolume::SetMute`, which is
+  idempotent; `WM_APPCOMMAND` remains only as a fallback and only when the state differs.
+- **Push-to-Talk blocked the keyboard**: `HookCallback` ran COM calls and a full config
+  file write inside the low-level keyboard hook on every keypress. Work is now posted to
+  the UI thread, and the mute state is no longer persisted on every push-to-talk stroke.
+- **Push-to-Talk broke under extra modifiers**: `CheckModifiers` required an exact match,
+  so a push-to-talk key without modifiers stopped working while Shift was held (sprint key
+  in games). Additional modifiers are now ignored.
+- **Unknown config keys were discarded**: `Config.Load()` dropped keys it did not know and
+  `SaveWithMutedState()` rewrote the whole file, so an older build silently destroyed the
+  configuration of a newer one. Unknown lines are now preserved verbatim.
+- **Double state change on startup**: the `else if (isMuted) SetMicMuted(true)` branch
+  toggled a second time. Removed; the default state is applied after the tray icon exists.
+- Hotkey registration failures were silent (`RegisterHotKey` return value ignored, and the
+  surrounding try/catch caught nothing because the function does not throw).
+
+### Added
+- **Logging** (`LOGGING_ENABLED`, default true): events are appended to `MicMuteLog.txt`
+  next to the executable, format `[yyyy-MM-dd HH:mm:ss] message`. Replaces `Debug.WriteLine`
+  and fills the previously empty catch blocks.
+- **Auto-mute on lock** (`AUTO_MUTE_ON_LOCK`, default false): mutes on session lock and
+  restores the previous state on unlock, via `SystemEvents.SessionSwitch`.
+- **Keyboard LED sync** (`LED_SYNC_ENABLED` default false, `LED_SYNC_KEY` default `Scroll`):
+  a keyboard LED indicates the muted state. Note that this also toggles the actual keyboard
+  mode, which is why it is off by default.
+- **App profiles** (`PROFILE_APPS`, default empty): per-application behaviour while that
+  application is in the foreground, format `discord.exe:ptt;obs64.exe:unmute;chrome.exe:mute`.
+  Driven by `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`, no polling.
+- **Tray menu quick switches**: status line plus checkable entries for push-to-talk, toast
+  notifications, auto-mute on lock and autostart, and an "open log" entry.
+- **Settings dialog**: new "Automation" tab for the three features above, logging checkbox
+  on the "General" tab.
+- **Hotkey validation**: a standalone key without modifiers is rejected (except F13-F24,
+  Pause and Scroll Lock, which would otherwise be swallowed system-wide), and the same
+  combination can no longer be assigned twice.
+
+### Changed
+- `Config.Clone()` replaces the 25-line object initialiser in `SettingsForm`, so new
+  properties cannot be forgotten when copying.
+- Toast and log output for state changes consolidated into `ReportStateChange()` instead of
+  being duplicated across five call sites.
+- `UpdateLanguage()` addresses controls through fields instead of guessing via
+  `grp.Controls.Contains(...)` and tab indices.
+- Single-instance mutex changed from `Global\` to `Local\`.
+- `AssemblyVersion` and `AssemblyFileVersion` set to 2.3.0.0 (previously absent, so the
+  executable reported 0.0.0.0).
+- Tray tooltip is translated; OK/Cancel buttons are translated.
+- `notes.txt` and `changes.txt` are now tracked in git.
+
+## [v2.2.0] - 2026-02-10
+
+### Added
+- **Multiple Hotkey Support**: Three independent global hotkeys with individual enable/disable controls
+  - Toggle Hotkey: Switch microphone on/off
+  - Mute Hotkey: Force microphone to muted state
+  - Unmute Hotkey: Force microphone to unmuted state
+  - Each hotkey supports Ctrl, Shift, Alt modifiers
+- **Push-to-Talk Feature**: Hold a key to enable microphone, release to mute
+  - Low-level keyboard hook implementation for reliable key detection
+  - Supports modifier keys (Ctrl, Shift, Alt)
+  - Optional toast notifications when activated/deactivated
+- **Toast Notification System**: Granular notifications for microphone status changes
+  - Show notification on toggle (microphone switched)
+  - Show notification on mute (microphone turned off)
+  - Show notification on unmute (microphone turned on)
+  - Show notification on app startup (displays current mic status)
+  - Show notification on push-to-talk (key pressed/released)
+- **Advanced Settings Tab**: New tab in settings dialog for power user features
+  - Push-to-Talk configuration
+  - Toast notification preferences
+  - Consolidated interface for advanced functionality
+- **Enhanced Microphone State Management**: Direct integration with Windows Core Audio API
+  - Reads actual system microphone mute state on startup
+  - Prevents unnecessary toggle operations when state already matches
+  - Fallback mechanism if system state cannot be read
+  - Saves and restores microphone state across app restarts
+- **Windows startup Integration**: Launch MicMute automatically with Windows (`HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`)
+  - Toggle in settings (General tab)
+  - Registry-based autostart management
+  - Synchronizes with actual Windows startup state
+
+### Changed
+- **Default Startup Behavior**: "Set microphone to default state on startup" now enabled by default with "Muted" as default state
+  - Ensures consistent microphone state on every app launch
+  - Previous behavior: app remembered last state from file
+- **Settings Window Redesign**: Reorganized into three tabs for better usability
+  - General: Click behavior, language, autostart, default state
+  - Global Hotkeys: All hotkey configurations with consistent layout
+  - Advanced: Push-to-Talk and toast notifications
+- **Settings Window Size**: Height increased from 520px to 540px to accommodate Advanced tab content
+- **Hotkey Display Consistency**: Fixed padding alignment across all hotkey labels
+  - All "Hotkey:" labels now positioned at Y=55 for visual consistency
+  - Push-to-Talk hotkey label aligned with Global Hotkeys tab layout
+
+### Fixed
+  - Single Instance Check (Mutex): A check has been added to prevent the program from being started multiple times (which would lead to hotkey conflicts and multiple tray icons).
+  - Resource management (memory leaks):
+      - The NotifyIcon is now cleanly disposed of when the application is closed to prevent “ghost icons” in the tray area.
+      - COM objects (in GetSystemMicrophoneMuteState) are released more robustly in a finally block to avoid memory leaks in the core audio area.
+  - Error tolerance (crash prevention):
+      - The loading of icons (mic_on.ico, mic_off.ico) is now wrapped in try-catch blocks. If the files are missing, the program no longer crashes but uses a system icon as a fallback.
+      - INI parsing has been made more robust (less sensitive to spaces).
+  - Logic improvement:
+      - The main method has been encapsulated in a try-finally block to ensure that hotkeys are deregistered and icons are removed even if an error occurs.
+      - GC.KeepAlive has been added to ensure that the garbage collector does not accidentally clean up the keyboard hook (although the static reference is usually sufficient, this is “best practice”).
+
+### Technical Details
+- **New Constants**:
+  - `HOTKEY_ID_TOGGLE = 9000`: Toggle hotkey identifier
+  - `HOTKEY_ID_MUTE = 9001`: Mute hotkey identifier
+  - `HOTKEY_ID_UNMUTE = 9002`: Unmute hotkey identifier
+  - `HOTKEY_ID_PUSH_TO_TALK = 9003`: Push-to-Talk identifier (unused, uses keyboard hook)
+  - Low-level keyboard hook constants (WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP)
+- **Config Class Extensions**:
+  - Hotkey properties split into three sets: `HotkeyToggle*`, `HotkeyMute*`, `HotkeyUnmute*`
+  - `PushToTalkEnabled`, `PushToTalkKey`, `PushToTalkModifiers`: Push-to-talk configuration
+  - `ShowToastOnToggle`, `ShowToastOnMute`, `ShowToastOnUnmute`: Individual notification toggles
+  - `ShowToastOnStartup`: Notification when app launches (renamed from ShowToastOnAutostart)
+  - `ShowToastOnPushToTalk`: Notification for push-to-talk activation/deactivation
+  - `AutostartEnabled`: Windows startup integration
+  - Removed: `ShowToastNotifications` (redundant master toggle)
+- **New Methods**:
+  - `SetupPushToTalkHook()`: Initializes low-level keyboard hook for push-to-talk
+  - `RemovePushToTalkHook()`: Cleans up keyboard hook on exit or settings change
+  - `HookCallback()`: Processes keyboard events for push-to-talk functionality
+  - `CheckModifiers()`: Validates that required modifier keys are pressed
+  - `GetSystemMicrophoneMuteState()`: Queries Windows Core Audio API for actual microphone state
+  - `LoadActualMicState()`: Reads system mic state on startup with file fallback
+  - `SaveMicStateToFile()`: Persists current microphone state to config
+  - `LoadMicStateFromFile()`: Restores microphone state from config
+  - `UnregisterAllHotkeys()`: Cleanup for all registered global hotkeys
+  - `RegisterGlobalHotkeys()`: Registers all enabled global hotkeys
+  - `Config.SetAutostart()`: Sets/removes registry entry for Windows autostart
+  - `Config.GetAutostartStatus()`: Reads current autostart status from registry
+- **Windows Core Audio API Integration**:
+  - COM interfaces: `IMMDeviceEnumerator`, `IMMDevice`, `IAudioEndpointVolume`
+  - P/Invoke declarations for `CoCreateInstance` and related COM methods
+  - VTBL structures for direct COM interface method access
+  - GUID constants for Core Audio interfaces

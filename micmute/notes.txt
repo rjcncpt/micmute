@@ -1,0 +1,22 @@
+MicMute v2.3.0
+
+Fixed
+- Mikrofonstatus wird wieder gelesen (COM-Interface war falsch aufgebaut)
+- Stummschalten setzt statt zu toggeln
+- Push-to-Talk blockiert die Tastatur nicht mehr
+- Unbekannte Config-Schluessel bleiben erhalten
+
+Added
+- Protokollierung (MicMuteLog.txt)
+- Stumm bei Windows-Sperre
+- Tastatur-LED als Mute-Anzeige
+- App-Profile je Vordergrund-Anwendung
+- Schnellschalter im Tray-Menue
+
+MicMute v2.2.0
+
+Added
+- Multiple Hotkey Support
+- Push-to-Talk Feature
+- Toast Notification System
+- Autostart Integration
