@@ -8,19 +8,24 @@ using System.Linq;
 using System.Diagnostics;
 using System.Text;
 using System.Threading;
+using System.Collections.Generic;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("MicMute2")]
 [assembly: AssemblyDescription("Edited by rjcncpt")]
-[assembly: AssemblyInformationalVersion("Edit date: 02/10/2026")]
+[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyFileVersion("2.3.0.0")]
+[assembly: AssemblyInformationalVersion("2.3.0")]
 [assembly: AssemblyCompanyAttribute("Source: rjcncpt")]
 
 namespace MicMute
 {
     class Program
     {
-        private const string Version = "v2.2.0";
-        private const string AppGuid = "B16C6A92-1234-4567-8901-MicMuteAppMutex"; 
+        private const string Version = "v2.3.0";
+        // Benutzerbezogene Anwendung: Local genügt, Global bräuchte je nach
+        // Konfiguration erhöhte Rechte und wirkte über Sitzungsgrenzen hinweg.
+        private const string AppMutexName = "Local\\MicMute2-SingleInstance";
 
         private const int WM_APPCOMMAND = 0x319;
         private const int APPCOMMAND_MICROPHONE_VOLUME_MUTE = 0x180000;
@@ -31,6 +36,32 @@ namespace MicMute
         private const int HOTKEY_ID_PUSH_TO_TALK = 9003;
 
         private static readonly string configFile = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "MicMuteConfig.ini");
+        internal static readonly string logFile = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "MicMuteLog.txt");
+
+        /// <summary>
+        /// Schreibt eine Zeile nach MicMuteLog.txt. Meldungen sind bewusst immer deutsch,
+        /// unabhängig von der eingestellten Oberflächensprache.
+        /// </summary>
+        // ponytail: Append ohne Rotation. Rotation erst, wenn die Datei real stört.
+        internal static void Log(string message)
+        {
+            if (config != null && !config.LoggingEnabled)
+                return;
+
+            try
+            {
+                File.AppendAllText(logFile, string.Format("[{0:yyyy-MM-dd HH:mm:ss}] {1}{2}", DateTime.Now, message, Environment.NewLine));
+            }
+            catch
+            {
+                // Logging darf die Anwendung nie zum Absturz bringen
+            }
+        }
+
+        internal static void Log(string context, Exception ex)
+        {
+            Log(string.Format("FEHLER in {0}: {1}", context, ex.Message));
+        }
 
         [DllImport("user32.dll", SetLastError = false)]
         public static extern IntPtr GetForegroundWindow();
@@ -57,6 +88,60 @@ namespace MicMute
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string lpModuleName);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
+            WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
+            int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+        private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+
+        [DllImport("user32.dll")]
+        private static extern short GetKeyState(int nVirtKey);
+
+        [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+
+        /// <summary>
+        /// Spiegelt den Mute-Status auf eine Tastatur-LED: LED an bedeutet stumm.
+        /// Achtung, das schaltet den echten Tastaturmodus mit - Rollen ist z.B. in
+        /// Excel funktional. Deshalb standardmäßig aus.
+        /// </summary>
+        // ponytail: keybd_event statt Hersteller-SDK. SDK erst, wenn eine bestimmte
+        // ponytail: Tastatur wirklich gefordert ist - das waere eine native DLL und
+        // ponytail: wuerde den Single-File-csc-Build brechen.
+        private static void SyncLed(bool muted)
+        {
+            if (config == null || !config.LedSyncEnabled || config.LedSyncKey == Keys.None)
+                return;
+
+            try
+            {
+                byte vk = (byte)config.LedSyncKey;
+                bool ledOn = (GetKeyState(vk) & 1) != 0;
+
+                if (ledOn != muted)
+                {
+                    keybd_event(vk, 0, 0, UIntPtr.Zero);
+                    keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("SyncLed", ex);
+            }
+        }
+
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         private const int WH_KEYBOARD_LL = 13;
@@ -69,8 +154,205 @@ namespace MicMute
         private static LowLevelKeyboardProc hookCallback;
         private static bool pushToTalkActive = false;
 
+        private static IntPtr winEventHook = IntPtr.Zero;
+        private static WinEventDelegate winEventCallback;
+
+        /// <summary>Zustand vor dem Aktivieren eines App-Profils, null wenn keins aktiv ist.</summary>
+        private static bool? stateBeforeProfile = null;
+        private static string activeProfileApp = null;
+        /// <summary>Push-to-Talk, das nicht aus den Einstellungen, sondern aus einem Profil kommt.</summary>
+        private static bool profilePushToTalk = false;
+
+        /// <summary>
+        /// Profilregeln aus PROFILE_APPS: "discord.exe:ptt;obs64.exe:unmute;chrome.exe:mute".
+        /// </summary>
+        private static Dictionary<string, string> ParseProfiles()
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            if (config == null || string.IsNullOrEmpty(config.ProfileApps))
+                return result;
+
+            foreach (string entry in config.ProfileApps.Split(';'))
+            {
+                if (string.IsNullOrEmpty(entry.Trim()))
+                    continue;
+
+                string[] parts = entry.Split(':');
+                if (parts.Length != 2)
+                    continue;
+
+                string app = parts[0].Trim();
+                string mode = parts[1].Trim().ToLowerInvariant();
+
+                if (app.Length > 0 && (mode == "mute" || mode == "unmute" || mode == "ptt"))
+                {
+                    result[app] = mode;
+                }
+            }
+
+            return result;
+        }
+
+        private static void SetupForegroundHook()
+        {
+            if (winEventHook != IntPtr.Zero)
+                return;
+
+            if (config == null || string.IsNullOrEmpty(config.ProfileApps))
+                return;
+
+            // ponytail: WinEvent-Hook statt Polling-Timer. Ein Handler, kein Scheduler.
+            winEventCallback = OnForegroundChanged;
+            winEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                IntPtr.Zero, winEventCallback, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+            if (winEventHook == IntPtr.Zero)
+            {
+                Log("App-Profile: Vordergrund-Hook konnte nicht registriert werden");
+            }
+        }
+
+        private static void RemoveForegroundHook()
+        {
+            if (winEventHook == IntPtr.Zero)
+                return;
+
+            UnhookWinEvent(winEventHook);
+            winEventHook = IntPtr.Zero;
+            winEventCallback = null;
+        }
+
+        private static string GetProcessNameOfWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero)
+                return null;
+
+            try
+            {
+                uint pid;
+                GetWindowThreadProcessId(hwnd, out pid);
+                if (pid == 0)
+                    return null;
+
+                using (Process p = Process.GetProcessById((int)pid))
+                {
+                    return p.ProcessName + ".exe";
+                }
+            }
+            catch
+            {
+                // Prozess kann zwischen Ereignis und Abfrage beendet sein - kein Fehlerfall
+                return null;
+            }
+        }
+
+        private static void OnForegroundChanged(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
+            int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        {
+            try
+            {
+                Dictionary<string, string> profiles = ParseProfiles();
+                if (profiles.Count == 0)
+                    return;
+
+                string exe = GetProcessNameOfWindow(hwnd);
+
+                string mode;
+                if (exe != null && profiles.TryGetValue(exe, out mode))
+                {
+                    if (string.Equals(activeProfileApp, exe, StringComparison.OrdinalIgnoreCase))
+                        return;
+
+                    if (!stateBeforeProfile.HasValue)
+                        stateBeforeProfile = isMuted;
+
+                    activeProfileApp = exe;
+                    profilePushToTalk = (mode == "ptt");
+
+                    Log(string.Format("App-Profil aktiv: {0} -> {1}", exe, mode));
+
+                    // ptt startet stumm, die Taste öffnet das Mikrofon
+                    PostToUi(mode != "unmute", MuteSource.Profile);
+                }
+                else if (activeProfileApp != null)
+                {
+                    bool restore = stateBeforeProfile.HasValue ? stateBeforeProfile.Value : isMuted;
+
+                    Log(string.Format("App-Profil verlassen: {0}", activeProfileApp));
+
+                    activeProfileApp = null;
+                    profilePushToTalk = false;
+                    stateBeforeProfile = null;
+
+                    PostToUi(restore, MuteSource.Profile);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("OnForegroundChanged", ex);
+            }
+        }
+
+        /// <summary>Zustand vor dem Sperren, null wenn die Sitzung nicht gesperrt ist.</summary>
+        private static bool? stateBeforeLock = null;
+        private static bool sessionSwitchHooked = false;
+
+        private static void SetupSessionSwitchHandler()
+        {
+            if (sessionSwitchHooked)
+                return;
+
+            SystemEvents.SessionSwitch += OnSessionSwitch;
+            sessionSwitchHooked = true;
+        }
+
+        private static void RemoveSessionSwitchHandler()
+        {
+            if (!sessionSwitchHooked)
+                return;
+
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
+            sessionSwitchHooked = false;
+        }
+
+        private static void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
+        {
+            if (config == null || !config.AutoMuteOnLock)
+                return;
+
+            bool leaving = e.Reason == SessionSwitchReason.SessionLock
+                        || e.Reason == SessionSwitchReason.SessionLogoff
+                        || e.Reason == SessionSwitchReason.RemoteDisconnect
+                        || e.Reason == SessionSwitchReason.ConsoleDisconnect;
+
+            bool returning = e.Reason == SessionSwitchReason.SessionUnlock
+                          || e.Reason == SessionSwitchReason.SessionLogon
+                          || e.Reason == SessionSwitchReason.RemoteConnect
+                          || e.Reason == SessionSwitchReason.ConsoleConnect;
+
+            if (leaving && !stateBeforeLock.HasValue)
+            {
+                stateBeforeLock = isMuted;
+                Log("Sitzung gesperrt - Mikrofon wird stummgeschaltet");
+                PostToUi(true, MuteSource.Lock);
+            }
+            else if (returning && stateBeforeLock.HasValue)
+            {
+                bool restore = stateBeforeLock.Value;
+                stateBeforeLock = null;
+                Log("Sitzung entsperrt - vorheriger Zustand wird wiederhergestellt");
+                PostToUi(restore, MuteSource.Lock);
+            }
+        }
+
         [DllImport("ole32.dll")]
         private static extern int CoCreateInstance(ref Guid clsid, IntPtr pUnkOuter, uint dwClsContext, ref Guid iid, out IntPtr ppv);
+
+        private const uint CLSCTX_INPROC_SERVER = 0x1;
+        private const int CLSCTX_ALL = 0x17;
+        private const int eCapture = 1;
+        private const int eConsole = 0;
 
         private static readonly Guid CLSID_MMDeviceEnumerator = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
         private static readonly Guid IID_IMMDeviceEnumerator = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
@@ -82,6 +364,12 @@ namespace MicMute
         private static ToolStripMenuItem unmuteItem;
         private static ToolStripMenuItem settingsItem;
         private static ToolStripMenuItem exitItem;
+        private static ToolStripMenuItem statusItem;
+        private static ToolStripMenuItem pttItem;
+        private static ToolStripMenuItem toastItem;
+        private static ToolStripMenuItem lockItem;
+        private static ToolStripMenuItem autostartItem;
+        private static ToolStripMenuItem logItem;
         private static HotkeyMessageWindow hotkeyWindow;
         private static Config config;
         
@@ -90,7 +378,16 @@ namespace MicMute
 
         private static void SetupPushToTalkHook()
         {
-            if (!config.PushToTalkEnabled || config.PushToTalkKey == Keys.None)
+            if (hookID != IntPtr.Zero)
+                return;
+
+            if (config.PushToTalkKey == Keys.None)
+                return;
+
+            // Der Hook wird auch gebraucht, wenn Push-to-Talk nicht global aktiv ist,
+            // sondern nur von einem App-Profil angefordert wird.
+            bool neededByProfile = config.ProfileApps != null && config.ProfileApps.ToLowerInvariant().Contains(":ptt");
+            if (!config.PushToTalkEnabled && !neededByProfile)
                 return;
 
             hookCallback = HookCallback;
@@ -112,61 +409,78 @@ namespace MicMute
 
         private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && config.PushToTalkEnabled)
+            // Dieser Callback läuft im Tastatur-Hook. Alles, was hier länger dauert,
+            // verzögert systemweit jeden Tastendruck; überschreitet es
+            // LowLevelHooksTimeout, entfernt Windows den Hook kommentarlos.
+            // Deshalb hier nur den Zustand ermitteln und die Arbeit auf den UI-Thread posten.
+            if (nCode >= 0 && config != null && (config.PushToTalkEnabled || profilePushToTalk) && config.PushToTalkKey != Keys.None)
             {
-                int vkCode = Marshal.ReadInt32(lParam);
-                Keys key = (Keys)vkCode;
-
-                bool isKeyDown = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN);
-                bool isKeyUp = (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP);
+                Keys key = (Keys)Marshal.ReadInt32(lParam);
 
                 if (key == config.PushToTalkKey && CheckModifiers(config.PushToTalkModifiers))
                 {
+                    bool isKeyDown = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN);
+                    bool isKeyUp = (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP);
+
                     if (isKeyDown && !pushToTalkActive)
                     {
                         pushToTalkActive = true;
-                        SetMicMuted(false);
-                        
-                        if (config.ShowToastOnPushToTalk)
-                        {
-                            string statusText = Translations.MicrophoneOn(config.AppLanguage);
-                            ShowNotification(string.Format("Push-to-Talk: {0}", statusText));
-                        }
+                        PostToUi(false, MuteSource.PushToTalk);
                     }
                     else if (isKeyUp && pushToTalkActive)
                     {
                         pushToTalkActive = false;
-                        SetMicMuted(true);
-                        
-                        if (config.ShowToastOnPushToTalk)
-                        {
-                            string statusText = Translations.MicrophoneOff(config.AppLanguage);
-                            ShowNotification(string.Format("Push-to-Talk: {0}", statusText));
-                        }
+                        PostToUi(true, MuteSource.PushToTalk);
                     }
                 }
             }
             return CallNextHookEx(hookID, nCode, wParam, lParam);
         }
 
+        /// <summary>
+        /// Reicht eine Zustandsänderung aus einem fremden Thread (Tastatur-Hook,
+        /// SystemEvents, WinEvent-Hook) an den UI-Thread weiter.
+        /// </summary>
+        private static void PostToUi(bool muted, MuteSource source)
+        {
+            try
+            {
+                if (hotkeyWindow != null && hotkeyWindow.IsHandleCreated)
+                {
+                    hotkeyWindow.BeginInvoke((MethodInvoker)delegate
+                    {
+                        SetMicMuted(muted, source);
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("PostToUi", ex);
+            }
+        }
+
+        /// <summary>
+        /// Prüft, ob die geforderten Modifier gedrückt sind. Zusätzlich gedrückte
+        /// Modifier stören bewusst nicht - sonst bricht Push-to-Talk, sobald man
+        /// nebenbei Shift oder Strg hält (Sprint-Taste in Spielen).
+        /// </summary>
         private static bool CheckModifiers(Keys modifiers)
         {
-            bool ctrlPressed = (Control.ModifierKeys & Keys.Control) == Keys.Control;
-            bool shiftPressed = (Control.ModifierKeys & Keys.Shift) == Keys.Shift;
-            bool altPressed = (Control.ModifierKeys & Keys.Alt) == Keys.Alt;
+            if ((modifiers & Keys.Control) == Keys.Control && (Control.ModifierKeys & Keys.Control) != Keys.Control)
+                return false;
+            if ((modifiers & Keys.Shift) == Keys.Shift && (Control.ModifierKeys & Keys.Shift) != Keys.Shift)
+                return false;
+            if ((modifiers & Keys.Alt) == Keys.Alt && (Control.ModifierKeys & Keys.Alt) != Keys.Alt)
+                return false;
 
-            bool ctrlNeeded = (modifiers & Keys.Control) == Keys.Control;
-            bool shiftNeeded = (modifiers & Keys.Shift) == Keys.Shift;
-            bool altNeeded = (modifiers & Keys.Alt) == Keys.Alt;
-
-            return (ctrlPressed == ctrlNeeded) && (shiftPressed == shiftNeeded) && (altPressed == altNeeded);
+            return true;
         }
 
         [STAThread]
         static void Main(string[] args)
         {
             bool createdNew;
-            using (Mutex mutex = new Mutex(true, "Global\\" + AppGuid, out createdNew))
+            using (Mutex mutex = new Mutex(true, AppMutexName, out createdNew))
             {
                 if (!createdNew)
                 {
@@ -187,11 +501,16 @@ namespace MicMute
                         trayIcon.Visible = false;
                         trayIcon.Dispose();
                     }
-                    
+
                     if (hookID != IntPtr.Zero)
                     {
                         UnhookWindowsHookEx(hookID);
                     }
+
+                    RemoveForegroundHook();
+
+                    // SystemEvents hält sonst eine statische Referenz auf den Handler
+                    RemoveSessionSwitchHandler();
                 }
             }
         }
@@ -219,25 +538,23 @@ namespace MicMute
         private static void RunApp()
         {
             config = Config.Load();
+            Log(string.Format("=== MicMute {0} gestartet ===", Version));
             LoadIcons();
             LoadActualMicState();
 
-            if (config.UseDefaultState)
-            {
-                isMuted = config.DefaultMutedState;
-                SetMicMuted(isMuted);
-            }
-            else if (isMuted)
-            {
-                SetMicMuted(true);
-            }
-
             trayIcon = new NotifyIcon();
             trayIcon.Icon = isMuted ? iconMuted : iconUnmuted;
-            trayIcon.Text = string.Format("MicMute: Microphone is {0}", isMuted ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage));
+            trayIcon.Text = Translations.TrayStatus(config.AppLanguage, isMuted);
             trayIcon.Visible = true;
 
             ContextMenuStrip menu = new ContextMenuStrip();
+
+            statusItem = new ToolStripMenuItem(Translations.TrayStatus(config.AppLanguage, isMuted));
+            statusItem.Enabled = false;
+            statusItem.Font = new Font(SystemFonts.DefaultFont, FontStyle.Bold);
+            menu.Items.Add(statusItem);
+
+            menu.Items.Add(new ToolStripSeparator());
 
             muteItem = new ToolStripMenuItem(Translations.MuteMicrophone(config.AppLanguage));
             muteItem.Click += SetMicMutedExplicit;
@@ -249,20 +566,88 @@ namespace MicMute
 
             menu.Items.Add(new ToolStripSeparator());
 
+            // Schnellschalter: jeder Haken wirkt sofort und wird sofort gespeichert.
+            pttItem = new ToolStripMenuItem(Translations.PushToTalk(config.AppLanguage));
+            pttItem.Click += delegate(object s, EventArgs e)
+            {
+                config.PushToTalkEnabled = !config.PushToTalkEnabled;
+                UnregisterAllHotkeys();
+                RegisterGlobalHotkeys();
+                SaveMicStateToFile();
+                Log("Push-to-Talk " + (config.PushToTalkEnabled ? "aktiviert" : "deaktiviert"));
+                SyncMenuChecks();
+            };
+            menu.Items.Add(pttItem);
+
+            toastItem = new ToolStripMenuItem(Translations.ToastNotifications(config.AppLanguage));
+            toastItem.Click += delegate(object s, EventArgs e)
+            {
+                bool enable = !AnyToastEnabled();
+                config.ShowToastOnToggle = enable;
+                config.ShowToastOnMute = enable;
+                config.ShowToastOnUnmute = enable;
+                config.ShowToastOnStartup = enable;
+                config.ShowToastOnPushToTalk = enable;
+                SaveMicStateToFile();
+                Log("Toast-Benachrichtigungen " + (enable ? "aktiviert" : "deaktiviert"));
+                SyncMenuChecks();
+            };
+            menu.Items.Add(toastItem);
+
+            lockItem = new ToolStripMenuItem(Translations.AutoMuteOnLock(config.AppLanguage));
+            lockItem.Click += delegate(object s, EventArgs e)
+            {
+                config.AutoMuteOnLock = !config.AutoMuteOnLock;
+                SaveMicStateToFile();
+                Log("Stumm bei Sperre " + (config.AutoMuteOnLock ? "aktiviert" : "deaktiviert"));
+                SyncMenuChecks();
+            };
+            menu.Items.Add(lockItem);
+
+            autostartItem = new ToolStripMenuItem(Translations.StartWithWindows(config.AppLanguage));
+            autostartItem.Click += delegate(object s, EventArgs e)
+            {
+                config.AutostartEnabled = !config.AutostartEnabled;
+                Config.SetAutostart(config.AutostartEnabled);
+                SaveMicStateToFile();
+                Log("Autostart " + (config.AutostartEnabled ? "aktiviert" : "deaktiviert"));
+                SyncMenuChecks();
+            };
+            menu.Items.Add(autostartItem);
+
+            menu.Items.Add(new ToolStripSeparator());
+
+            logItem = new ToolStripMenuItem(Translations.OpenLog(config.AppLanguage));
+            logItem.Click += delegate(object s, EventArgs e)
+            {
+                try
+                {
+                    if (File.Exists(logFile))
+                    {
+                        Process.Start(logFile);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("OpenLog", ex);
+                }
+            };
+            menu.Items.Add(logItem);
+
             settingsItem = new ToolStripMenuItem(Translations.Settings(config.AppLanguage));
             settingsItem.Click += delegate(object s, EventArgs e) { ShowSettings(); };
             menu.Items.Add(settingsItem);
 
-            menu.Items.Add(new ToolStripSeparator());
-
             exitItem = new ToolStripMenuItem(Translations.Exit(config.AppLanguage));
             exitItem.Click += delegate(object s, EventArgs e)
             {
+                Log("=== MicMute beendet ===");
+                UnregisterAllHotkeys();
                 if (hotkeyWindow != null) hotkeyWindow.Close();
                 Application.Exit();
             };
             menu.Items.Add(exitItem);
-            
+
             menu.Items.Add(new ToolStripSeparator());
 
             var versionItem = new ToolStripMenuItem(string.Format("MicMute {0} – by rjcncpt", Version));
@@ -271,6 +656,7 @@ namespace MicMute
             menu.Items.Add(versionItem);
 
             trayIcon.ContextMenuStrip = menu;
+            SyncMenuChecks();
             
             if (config.UseDoubleClick)
             {
@@ -282,6 +668,13 @@ namespace MicMute
                 trayIcon.MouseUp += MouseUp;
             }
 
+            // Erst jetzt, weil SetMicMuted das Tray-Icon aktualisiert.
+            // SetMute ist idempotent, ein Vergleich mit dem Ist-Zustand erübrigt sich.
+            if (config.UseDefaultState)
+            {
+                SetMicMuted(config.DefaultMutedState);
+            }
+
             UpdateTrayIcon();
 
             if (config.ShowToastOnStartup)
@@ -291,7 +684,19 @@ namespace MicMute
             }
 
             hotkeyWindow = new HotkeyMessageWindow();
-            RegisterGlobalHotkeys();
+            // Handle erzwingen: der Tastatur-Hook postet per BeginInvoke hierher,
+            // auch wenn gar kein globaler Hotkey registriert wird.
+            if (hotkeyWindow.Handle == IntPtr.Zero)
+            {
+                Log("Fensterhandle für Hotkeys konnte nicht erstellt werden");
+            }
+
+            if (!RegisterGlobalHotkeys())
+            {
+                ShowNotification(Translations.HotkeyRegisterFailed(config.AppLanguage));
+            }
+
+            SetupSessionSwitchHandler();
 
             GC.KeepAlive(hookCallback);
 
@@ -355,48 +760,60 @@ namespace MicMute
                         }
                     }
 
-                    if (previousLanguage != config.AppLanguage)
+                    // Deckt Sprachwechsel und alle Schnellschalter in einem ab
+                    SyncMenuChecks();
+
+                    if (!RegisterGlobalHotkeys())
                     {
-                        muteItem.Text = Translations.MuteMicrophone(config.AppLanguage);
-                        unmuteItem.Text = Translations.UnmuteMicrophone(config.AppLanguage);
-                        settingsItem.Text = Translations.Settings(config.AppLanguage);
-                        exitItem.Text = Translations.Exit(config.AppLanguage);
-                        UpdateTrayIcon();
+                        MessageBox.Show(
+                            Translations.HotkeyRegisterFailed(config.AppLanguage),
+                            "MicMute", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }
-                    
-                    RegisterGlobalHotkeys();
                 }
             }
         }
 
-        private static void RegisterGlobalHotkeys()
+        /// <summary>
+        /// Registriert alle aktivierten Hotkeys. Liefert false, wenn mindestens einer
+        /// abgelehnt wurde - typischerweise weil ein anderes Programm ihn belegt.
+        /// </summary>
+        private static bool RegisterGlobalHotkeys()
         {
+            bool allOk = true;
+
             try
             {
-                if (config.HotkeyToggleEnabled && config.HotkeyToggleKey != Keys.None)
-                {
-                    uint modifiers = GetModifiers(config.HotkeyToggleModifiers);
-                    RegisterHotKey(hotkeyWindow.Handle, HOTKEY_ID_TOGGLE, modifiers, (uint)config.HotkeyToggleKey);
-                }
-
-                if (config.HotkeyMuteEnabled && config.HotkeyMuteKey != Keys.None)
-                {
-                    uint modifiers = GetModifiers(config.HotkeyMuteModifiers);
-                    RegisterHotKey(hotkeyWindow.Handle, HOTKEY_ID_MUTE, modifiers, (uint)config.HotkeyMuteKey);
-                }
-
-                if (config.HotkeyUnmuteEnabled && config.HotkeyUnmuteKey != Keys.None)
-                {
-                    uint modifiers = GetModifiers(config.HotkeyUnmuteModifiers);
-                    RegisterHotKey(hotkeyWindow.Handle, HOTKEY_ID_UNMUTE, modifiers, (uint)config.HotkeyUnmuteKey);
-                }
+                allOk &= TryRegister(config.HotkeyToggleEnabled, config.HotkeyToggleKey, config.HotkeyToggleModifiers, HOTKEY_ID_TOGGLE, "Umschalten");
+                allOk &= TryRegister(config.HotkeyMuteEnabled, config.HotkeyMuteKey, config.HotkeyMuteModifiers, HOTKEY_ID_MUTE, "Stummschalten");
+                allOk &= TryRegister(config.HotkeyUnmuteEnabled, config.HotkeyUnmuteKey, config.HotkeyUnmuteModifiers, HOTKEY_ID_UNMUTE, "Einschalten");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine("Fehler beim Registrieren der Hotkeys: " + ex.Message);
+                Log("RegisterGlobalHotkeys", ex);
+                allOk = false;
+            }
+
+            if (allOk)
+            {
+                Log("Hotkeys registriert");
             }
 
             SetupPushToTalkHook();
+            SetupForegroundHook();
+
+            return allOk;
+        }
+
+        private static bool TryRegister(bool enabled, Keys key, Keys modifiers, int id, string label)
+        {
+            if (!enabled || key == Keys.None)
+                return true;
+
+            if (RegisterHotKey(hotkeyWindow.Handle, id, GetModifiers(modifiers), (uint)key))
+                return true;
+
+            Log(string.Format("Hotkey '{0}' ({1}) konnte nicht registriert werden - vermutlich bereits belegt", label, key));
+            return false;
         }
 
         private static void UnregisterAllHotkeys()
@@ -408,8 +825,9 @@ namespace MicMute
                 UnregisterHotKey(hotkeyWindow.Handle, HOTKEY_ID_UNMUTE);
             } 
             catch { }
-            
+
             RemovePushToTalkHook();
+            RemoveForegroundHook();
         }
 
         private static uint GetModifiers(Keys modifierKeys)
@@ -438,10 +856,11 @@ namespace MicMute
                     stateLoadedFromSystem = true;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Log("LoadActualMicState", ex);
             }
-            
+
             if (!stateLoadedFromSystem)
             {
                 LoadMicStateFromFile();
@@ -456,55 +875,115 @@ namespace MicMute
             }
         }
 
-        private static bool? GetSystemMicrophoneMuteState()
+        /// <summary>
+        /// Beschafft IAudioEndpointVolume für das Standard-Aufnahmegerät.
+        /// Der Aufrufer besitzt den Zeiger und muss SafeRelease() darauf aufrufen.
+        /// </summary>
+        private static bool TryGetEndpointVolume(out IntPtr endpointVolume, out IAudioEndpointVolumeVtbl volumeVtbl)
         {
+            endpointVolume = IntPtr.Zero;
+            volumeVtbl = default(IAudioEndpointVolumeVtbl);
+
             IntPtr deviceEnumerator = IntPtr.Zero;
             IntPtr device = IntPtr.Zero;
-            IntPtr endpointVolume = IntPtr.Zero;
 
             try
             {
                 Guid clsid = CLSID_MMDeviceEnumerator;
                 Guid iid = IID_IMMDeviceEnumerator;
-                
-                int hr = CoCreateInstance(ref clsid, IntPtr.Zero, 1, ref iid, out deviceEnumerator);
+
+                int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC_SERVER, ref iid, out deviceEnumerator);
                 if (hr != 0 || deviceEnumerator == IntPtr.Zero)
-                    return null;
+                    return false;
 
                 var vtbl = (IMMDeviceEnumeratorVtbl)Marshal.PtrToStructure(
                     Marshal.ReadIntPtr(deviceEnumerator), typeof(IMMDeviceEnumeratorVtbl));
-                
-                hr = vtbl.GetDefaultAudioEndpoint(deviceEnumerator, 1, 0, out device); 
+
+                hr = vtbl.GetDefaultAudioEndpoint(deviceEnumerator, eCapture, eConsole, out device);
                 if (hr != 0 || device == IntPtr.Zero)
-                    return null;
+                    return false;
 
                 var deviceVtbl = (IMMDeviceVtbl)Marshal.PtrToStructure(
                     Marshal.ReadIntPtr(device), typeof(IMMDeviceVtbl));
-                
-                Guid volumeIid = IID_IAudioEndpointVolume;
-                hr = deviceVtbl.Activate(device, ref volumeIid, 0, IntPtr.Zero, out endpointVolume);
-                if (hr != 0 || endpointVolume == IntPtr.Zero)
-                    return null;
 
-                var volumeVtbl = (IAudioEndpointVolumeVtbl)Marshal.PtrToStructure(
+                Guid volumeIid = IID_IAudioEndpointVolume;
+                hr = deviceVtbl.Activate(device, ref volumeIid, CLSCTX_ALL, IntPtr.Zero, out endpointVolume);
+                if (hr != 0 || endpointVolume == IntPtr.Zero)
+                {
+                    endpointVolume = IntPtr.Zero;
+                    return false;
+                }
+
+                volumeVtbl = (IAudioEndpointVolumeVtbl)Marshal.PtrToStructure(
                     Marshal.ReadIntPtr(endpointVolume), typeof(IAudioEndpointVolumeVtbl));
-                
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("TryGetEndpointVolume", ex);
+                return false;
+            }
+            finally
+            {
+                SafeRelease(device);
+                SafeRelease(deviceEnumerator);
+            }
+        }
+
+        private static bool? GetSystemMicrophoneMuteState()
+        {
+            IntPtr endpointVolume;
+            IAudioEndpointVolumeVtbl volumeVtbl;
+
+            if (!TryGetEndpointVolume(out endpointVolume, out volumeVtbl))
+                return null;
+
+            try
+            {
                 int muted;
-                hr = volumeVtbl.GetMute(endpointVolume, out muted);
-                if (hr != 0)
+                if (volumeVtbl.GetMute(endpointVolume, out muted) < 0)
                     return null;
 
                 return muted != 0;
             }
-            catch
+            catch (Exception ex)
             {
+                Log("GetSystemMicrophoneMuteState", ex);
                 return null;
             }
             finally
             {
                 SafeRelease(endpointVolume);
-                SafeRelease(device);
-                SafeRelease(deviceEnumerator);
+            }
+        }
+
+        /// <summary>
+        /// Setzt den Mute-Status direkt. Anders als WM_APPCOMMAND ist das kein Toggle,
+        /// sondern idempotent.
+        /// </summary>
+        private static bool SetSystemMicrophoneMuteState(bool muted)
+        {
+            IntPtr endpointVolume;
+            IAudioEndpointVolumeVtbl volumeVtbl;
+
+            if (!TryGetEndpointVolume(out endpointVolume, out volumeVtbl))
+                return false;
+
+            try
+            {
+                Guid eventContext = Guid.Empty;
+                // S_FALSE (1) bedeutet "war bereits in diesem Zustand" und ist ein Erfolg.
+                return volumeVtbl.SetMute(endpointVolume, muted ? 1 : 0, ref eventContext) >= 0;
+            }
+            catch (Exception ex)
+            {
+                Log("SetSystemMicrophoneMuteState", ex);
+                return false;
+            }
+            finally
+            {
+                SafeRelease(endpointVolume);
             }
         }
 
@@ -551,6 +1030,10 @@ namespace MicMute
             public IntPtr QueryInterface;
             public IntPtr AddRef;
             public IntPtr Release;
+            // EnumAudioEndpoints ist Slot 3 des Interfaces. Fehlte bis v2.2.0, dadurch
+            // landete jeder GetDefaultAudioEndpoint-Aufruf auf EnumAudioEndpoints und
+            // scheiterte mit E_INVALIDARG (0x80070057) - der Mute-Status wurde nie gelesen.
+            public IntPtr EnumAudioEndpoints;
             public GetDefaultAudioEndpointDelegate GetDefaultAudioEndpoint;
 
             [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -599,56 +1082,95 @@ namespace MicMute
             public delegate int GetMuteDelegate(IntPtr This, out int pbMute);
         }
 
+        /// <summary>Auslöser einer Zustandsänderung - steuert Toast und Logeintrag.</summary>
+        private enum MuteSource { Silent, Toggle, Mute, Unmute, PushToTalk, Lock, Profile }
+
         private static void ToggleMic(object sender, EventArgs e)
         {
-            isMuted = !isMuted;
-            SetMicMuted(isMuted);
-            
-            if (config.ShowToastOnToggle)
-            {
-                string statusText = isMuted ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage);
-                ShowNotification(string.Format("{0}: {1}", Translations.Microphone(config.AppLanguage), statusText));
-            }
+            SetMicMuted(!isMuted, MuteSource.Toggle);
         }
 
         private static void SetMicMutedExplicit(object sender, EventArgs e)
         {
-            isMuted = true;
-            SetMicMuted(true);
-            
-            if (config.ShowToastOnMute)
-            {
-                string statusText = Translations.MicrophoneOff(config.AppLanguage);
-                ShowNotification(string.Format("{0}: {1}", Translations.Microphone(config.AppLanguage), statusText));
-            }
+            SetMicMuted(true, MuteSource.Mute);
         }
 
         private static void SetMicUnmutedExplicit(object sender, EventArgs e)
         {
-            isMuted = false;
-            SetMicMuted(false);
-            
-            if (config.ShowToastOnUnmute)
-            {
-                string statusText = Translations.MicrophoneOn(config.AppLanguage);
-                ShowNotification(string.Format("{0}: {1}", Translations.Microphone(config.AppLanguage), statusText));
-            }
+            SetMicMuted(false, MuteSource.Unmute);
         }
 
         private static void SetMicMuted(bool muted)
         {
+            SetMicMuted(muted, MuteSource.Silent);
+        }
+
+        private static void SetMicMuted(bool muted, MuteSource source)
+        {
             isMuted = muted;
-            
-            bool? actualSystemState = GetSystemMicrophoneMuteState();
-            
-            if (!actualSystemState.HasValue || actualSystemState.Value != muted)
+
+            if (!SetSystemMicrophoneMuteState(muted))
             {
-                IntPtr hwnd = GetForegroundWindow();
-                SendMessageW(hwnd, WM_APPCOMMAND, hwnd, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
+                // Fallback für Systeme ohne nutzbares IAudioEndpointVolume.
+                // WM_APPCOMMAND ist ein Toggle, wird also nur bei echtem Unterschied gesendet.
+                bool? actualSystemState = GetSystemMicrophoneMuteState();
+                if (!actualSystemState.HasValue || actualSystemState.Value != muted)
+                {
+                    IntPtr hwnd = GetForegroundWindow();
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        SendMessageW(hwnd, WM_APPCOMMAND, hwnd, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
+                    }
+                }
             }
-            
+
             UpdateTrayIcon();
-            SaveMicStateToFile();
+            SyncLed(muted);
+
+            // Push-to-Talk feuert pro Tastendruck - dabei nicht bei jedem Anschlag
+            // die komplette Konfigurationsdatei neu schreiben.
+            if (source != MuteSource.PushToTalk)
+            {
+                SaveMicStateToFile();
+            }
+
+            ReportStateChange(muted, source);
+        }
+
+        /// <summary>Logeintrag und Toast für eine Zustandsänderung - eine Stelle statt fünf.</summary>
+        private static void ReportStateChange(bool muted, MuteSource source)
+        {
+            if (source == MuteSource.Silent)
+                return;
+
+            string label;
+            bool showToast;
+
+            switch (source)
+            {
+                case MuteSource.Toggle:     label = "Toggle";       showToast = config.ShowToastOnToggle; break;
+                case MuteSource.Mute:       label = "Stummschalten"; showToast = config.ShowToastOnMute; break;
+                case MuteSource.Unmute:     label = "Einschalten";  showToast = config.ShowToastOnUnmute; break;
+                case MuteSource.PushToTalk: label = "Push-to-Talk"; showToast = config.ShowToastOnPushToTalk; break;
+                case MuteSource.Lock:       label = "Sperre";       showToast = false; break;
+                case MuteSource.Profile:    label = "App-Profil";   showToast = false; break;
+                default: return;
+            }
+
+            Log(string.Format("{0}: Mikrofon {1}", label, muted ? "ausgeschaltet" : "eingeschaltet"));
+
+            if (showToast)
+            {
+                string statusText = muted
+                    ? Translations.MicrophoneOff(config.AppLanguage)
+                    : Translations.MicrophoneOn(config.AppLanguage);
+
+                string title = source == MuteSource.PushToTalk
+                    ? "Push-to-Talk"
+                    : Translations.Microphone(config.AppLanguage);
+
+                ShowNotification(string.Format("{0}: {1}", title, statusText));
+            }
         }
 
         private static void UpdateTrayIcon()
@@ -656,13 +1178,68 @@ namespace MicMute
             try
             {
                 trayIcon.Icon = isMuted ? iconMuted : iconUnmuted;
-                trayIcon.Text = string.Format("MicMute: Microphone is {0}", isMuted ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage));
+                trayIcon.Text = Translations.TrayStatus(config.AppLanguage, isMuted);
+
+                if (statusItem != null)
+                    statusItem.Text = Translations.TrayStatus(config.AppLanguage, isMuted);
 
                 muteItem.Visible = !isMuted;
                 unmuteItem.Visible = isMuted;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Log("UpdateTrayIcon", ex);
+            }
+        }
+
+        private static bool AnyToastEnabled()
+        {
+            return config.ShowToastOnToggle || config.ShowToastOnMute || config.ShowToastOnUnmute
+                || config.ShowToastOnStartup || config.ShowToastOnPushToTalk;
+        }
+
+        /// <summary>
+        /// Bringt Haken, Beschriftungen und Sichtbarkeit im Tray-Menü auf den Stand
+        /// der Konfiguration. Nach dem Einstellungsdialog und nach jedem Schnellschalter.
+        /// </summary>
+        private static void SyncMenuChecks()
+        {
+            if (statusItem == null)
+                return;
+
+            try
+            {
+                Language lang = config.AppLanguage;
+
+                statusItem.Text = Translations.TrayStatus(lang, isMuted);
+
+                muteItem.Text = Translations.MuteMicrophone(lang);
+                unmuteItem.Text = Translations.UnmuteMicrophone(lang);
+                settingsItem.Text = Translations.Settings(lang);
+                exitItem.Text = Translations.Exit(lang);
+
+                pttItem.Text = Translations.PushToTalk(lang);
+                pttItem.Checked = config.PushToTalkEnabled;
+                // Ohne belegte Taste ist der Schalter wirkungslos
+                pttItem.Visible = config.PushToTalkKey != Keys.None;
+
+                toastItem.Text = Translations.ToastNotifications(lang);
+                toastItem.Checked = AnyToastEnabled();
+
+                lockItem.Text = Translations.AutoMuteOnLock(lang);
+                lockItem.Checked = config.AutoMuteOnLock;
+
+                autostartItem.Text = Translations.StartWithWindows(lang);
+                autostartItem.Checked = config.AutostartEnabled;
+
+                logItem.Text = Translations.OpenLog(lang);
+                logItem.Visible = config.LoggingEnabled;
+
+                UpdateTrayIcon();
+            }
+            catch (Exception ex)
+            {
+                Log("SyncMenuChecks", ex);
             }
         }
 
@@ -678,8 +1255,9 @@ namespace MicMute
                     trayIcon.ShowBalloonTip(2000);
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Log("ShowNotification", ex);
             }
         }
 
@@ -910,6 +1488,129 @@ namespace MicMute
         {
             return lang == Language.German ? "Mikrofon" : "Microphone";
         }
+
+        /// <summary>Statuszeile für Tray-Tooltip und Menükopf.</summary>
+        public static string TrayStatus(Language lang, bool muted)
+        {
+            return string.Format("{0}: {1}", Microphone(lang), muted ? MicrophoneOff(lang) : MicrophoneOn(lang));
+        }
+
+        public static string OK(Language lang)
+        {
+            return "OK";
+        }
+
+        public static string Cancel(Language lang)
+        {
+            return lang == Language.German ? "Abbrechen" : "Cancel";
+        }
+
+        public static string OpenLog(Language lang)
+        {
+            return lang == Language.German ? "Protokoll öffnen" : "Open log";
+        }
+
+        public static string Logging(Language lang)
+        {
+            return lang == Language.German ? "Protokollierung" : "Logging";
+        }
+
+        public static string EnableLogging(Language lang)
+        {
+            return lang == Language.German ? "Ereignisse in MicMuteLog.txt protokollieren" : "Log events to MicMuteLog.txt";
+        }
+
+        public static string Automation(Language lang)
+        {
+            return lang == Language.German ? "Automatik" : "Automation";
+        }
+
+        public static string AutoMuteOnLock(Language lang)
+        {
+            return lang == Language.German ? "Stumm bei Sperre" : "Mute on lock";
+        }
+
+        public static string AutoMuteOnLockDescription(Language lang)
+        {
+            return lang == Language.German
+                ? "Mikrofon beim Sperren stummschalten und beim Entsperren wiederherstellen"
+                : "Mute the microphone on lock and restore it on unlock";
+        }
+
+        public static string LedSync(Language lang)
+        {
+            return lang == Language.German ? "Tastatur-LED" : "Keyboard LED";
+        }
+
+        public static string EnableLedSync(Language lang)
+        {
+            return lang == Language.German ? "LED leuchtet, wenn das Mikrofon stumm ist" : "LED lights up while the microphone is muted";
+        }
+
+        public static string LedSyncWarning(Language lang)
+        {
+            return lang == Language.German
+                ? "Achtung: schaltet den echten Tastaturmodus mit. Rollen ist z. B. in Excel funktional."
+                : "Note: this also toggles the actual keyboard mode. Scroll Lock is functional in Excel, for example.";
+        }
+
+        public static string AppProfiles(Language lang)
+        {
+            return lang == Language.German ? "App-Profile" : "App profiles";
+        }
+
+        public static string AppProfilesDescription(Language lang)
+        {
+            return lang == Language.German
+                ? "Verhalten, solange die Anwendung im Vordergrund ist"
+                : "Behaviour while the application is in the foreground";
+        }
+
+        public static string Add(Language lang)
+        {
+            return lang == Language.German ? "Hinzufügen" : "Add";
+        }
+
+        public static string Remove(Language lang)
+        {
+            return lang == Language.German ? "Entfernen" : "Remove";
+        }
+
+        public static string ProfileModeMute(Language lang)
+        {
+            return lang == Language.German ? "Stumm" : "Muted";
+        }
+
+        public static string ProfileModeUnmute(Language lang)
+        {
+            return lang == Language.German ? "Aktiv" : "Unmuted";
+        }
+
+        public static string ProfileModePtt(Language lang)
+        {
+            return lang == Language.German ? "Push-to-Talk" : "Push-to-talk";
+        }
+
+        public static string HotkeyRegisterFailed(Language lang)
+        {
+            return lang == Language.German
+                ? "Mindestens ein globaler Hotkey konnte nicht registriert werden. Vermutlich wird er bereits von einem anderen Programm benutzt."
+                : "At least one global hotkey could not be registered. It is probably already in use by another application.";
+        }
+
+        public static string HotkeyNeedsModifier(Language lang)
+        {
+            return lang == Language.German
+                ? "Ein globaler Hotkey braucht mindestens Strg, Umschalt oder Alt.\nEinzelne Tasten sind nur für F13-F24, Pause und Rollen erlaubt."
+                : "A global hotkey needs at least Ctrl, Shift or Alt.\nStandalone keys are only allowed for F13-F24, Pause and Scroll Lock.";
+        }
+
+        public static string HotkeyDuplicate(Language lang)
+        {
+            return lang == Language.German
+                ? "Dieselbe Tastenkombination ist mehrfach vergeben. Bitte unterschiedliche Kombinationen wählen."
+                : "The same key combination is assigned more than once. Please choose different combinations.";
+        }
     }
 
     public class Config
@@ -942,6 +1643,18 @@ namespace MicMute
         public Language AppLanguage { get; set; }
         public bool AutostartEnabled { get; set; }
 
+        public bool LoggingEnabled { get; set; }
+        public bool AutoMuteOnLock { get; set; }
+        public bool LedSyncEnabled { get; set; }
+        public Keys LedSyncKey { get; set; }
+        public string ProfileApps { get; set; }
+
+        /// <summary>
+        /// Zeilen, die diese Version nicht kennt. Werden unverändert zurückgeschrieben,
+        /// damit eine ältere Version die Konfiguration einer neueren nicht zerstört.
+        /// </summary>
+        private List<string> unknownLines = new List<string>();
+
         private static readonly string configFile = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "MicMuteConfig.ini");
 
         public Config()
@@ -973,6 +1686,23 @@ namespace MicMute
             UseDoubleClick = false;
             AppLanguage = Language.English;
             AutostartEnabled = false;
+
+            LoggingEnabled = true;
+            AutoMuteOnLock = false;
+            LedSyncEnabled = false;
+            LedSyncKey = Keys.Scroll;
+            ProfileApps = "";
+        }
+
+        /// <summary>
+        /// Vollständige Kopie inklusive unbekannter Zeilen. Bewusst statt eines
+        /// Objektinitialisierers, damit neue Properties nicht vergessen werden können.
+        /// </summary>
+        public Config Clone()
+        {
+            Config copy = (Config)this.MemberwiseClone();
+            copy.unknownLines = new List<string>(this.unknownLines);
+            return copy;
         }
 
         public static Config Load()
@@ -1074,15 +1804,41 @@ namespace MicMute
                         case "LANGUAGE": 
                             if(Enum.TryParse(val, out lVal)) config.AppLanguage = lVal; 
                             break;
-                        case "AUTOSTART_ENABLED": 
-                            if(bool.TryParse(val, out bVal)) config.AutostartEnabled = bVal; 
+                        case "AUTOSTART_ENABLED":
+                            if(bool.TryParse(val, out bVal)) config.AutostartEnabled = bVal;
+                            break;
+
+                        case "LOGGING_ENABLED":
+                            if(bool.TryParse(val, out bVal)) config.LoggingEnabled = bVal;
+                            break;
+                        case "AUTO_MUTE_ON_LOCK":
+                            if(bool.TryParse(val, out bVal)) config.AutoMuteOnLock = bVal;
+                            break;
+                        case "LED_SYNC_ENABLED":
+                            if(bool.TryParse(val, out bVal)) config.LedSyncEnabled = bVal;
+                            break;
+                        case "LED_SYNC_KEY":
+                            if(Enum.TryParse(val, out kVal)) config.LedSyncKey = kVal;
+                            break;
+                        case "PROFILE_APPS":
+                            config.ProfileApps = val;
+                            break;
+
+                        // Wird von LoadMicStateFromFile gelesen und von SaveWithMutedState
+                        // geschrieben - hier nur abfangen, damit es nicht als unbekannt gilt.
+                        case "MUTED":
+                            break;
+
+                        default:
+                            config.unknownLines.Add(line);
                             break;
                     }
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
                 // Bei groben Fehlern werden Defaults genutzt
+                Program.Log("Config.Load", ex);
             }
 
             // Sync Autostart status with Registry logic
@@ -1149,12 +1905,26 @@ namespace MicMute
                 sb.AppendLine("USE_DOUBLE_CLICK=" + UseDoubleClick);
                 sb.AppendLine("LANGUAGE=" + AppLanguage);
                 sb.AppendLine("AUTOSTART_ENABLED=" + AutostartEnabled);
+
+                sb.AppendLine("LOGGING_ENABLED=" + LoggingEnabled);
+                sb.AppendLine("AUTO_MUTE_ON_LOCK=" + AutoMuteOnLock);
+                sb.AppendLine("LED_SYNC_ENABLED=" + LedSyncEnabled);
+                sb.AppendLine("LED_SYNC_KEY=" + LedSyncKey);
+                sb.AppendLine("PROFILE_APPS=" + ProfileApps);
+
                 sb.AppendLine("MUTED=" + isMuted.ToString().ToUpper());
+
+                // Unbekannte Zeilen unverändert erhalten
+                foreach (string unknown in unknownLines)
+                {
+                    sb.AppendLine(unknown);
+                }
 
                 File.WriteAllText(configFile, sb.ToString());
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Program.Log("Config.Save", ex);
             }
         }
 
@@ -1181,8 +1951,9 @@ namespace MicMute
                     }
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Program.Log("Config.SetAutostart", ex);
             }
         }
 
@@ -1199,8 +1970,9 @@ namespace MicMute
                     }
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Program.Log("Config.GetAutostartStatus", ex);
             }
             return false;
         }
@@ -1249,6 +2021,30 @@ namespace MicMute
         private CheckBox chkShowToastOnPushToTalk;
         private GroupBox grpPushToTalk;
         private GroupBox grpNotifications;
+
+        private GroupBox grpLogging;
+        private CheckBox chkLogging;
+
+        private TabPage tabAutomation;
+        private GroupBox grpAutoLock;
+        private CheckBox chkAutoMuteOnLock;
+        private Label lblAutoLockDesc;
+        private GroupBox grpLed;
+        private CheckBox chkLedSync;
+        private ComboBox cmbLedKey;
+        private Label lblLedWarning;
+        private GroupBox grpProfiles;
+        private Label lblProfilesDesc;
+        private ListBox lstProfiles;
+        private ComboBox cmbProfileApp;
+        private ComboBox cmbProfileMode;
+        private Button btnAddProfile;
+        private Button btnRemoveProfile;
+
+        private GroupBox grpToggle;
+        private GroupBox grpMute;
+        private GroupBox grpUnmute;
+        private Label lblInfo;
         
         private Keys toggleKey = Keys.None;
         private Keys toggleModifiers = Keys.None;
@@ -1263,31 +2059,7 @@ namespace MicMute
 
         public SettingsForm(Config cfg)
         {
-            this.config = new Config
-            {
-                HotkeyToggleEnabled = cfg.HotkeyToggleEnabled,
-                HotkeyToggleKey = cfg.HotkeyToggleKey,
-                HotkeyToggleModifiers = cfg.HotkeyToggleModifiers,
-                HotkeyMuteEnabled = cfg.HotkeyMuteEnabled,
-                HotkeyMuteKey = cfg.HotkeyMuteKey,
-                HotkeyMuteModifiers = cfg.HotkeyMuteModifiers,
-                HotkeyUnmuteEnabled = cfg.HotkeyUnmuteEnabled,
-                HotkeyUnmuteKey = cfg.HotkeyUnmuteKey,
-                HotkeyUnmuteModifiers = cfg.HotkeyUnmuteModifiers,
-                PushToTalkEnabled = cfg.PushToTalkEnabled,
-                PushToTalkKey = cfg.PushToTalkKey,
-                PushToTalkModifiers = cfg.PushToTalkModifiers,
-                ShowToastOnToggle = cfg.ShowToastOnToggle,
-                ShowToastOnMute = cfg.ShowToastOnMute,
-                ShowToastOnUnmute = cfg.ShowToastOnUnmute,
-                ShowToastOnStartup = cfg.ShowToastOnStartup,
-                ShowToastOnPushToTalk = cfg.ShowToastOnPushToTalk,
-                UseDefaultState = cfg.UseDefaultState,
-                DefaultMutedState = cfg.DefaultMutedState,
-                UseDoubleClick = cfg.UseDoubleClick,
-                AppLanguage = cfg.AppLanguage,
-                AutostartEnabled = cfg.AutostartEnabled
-            };
+            this.config = cfg.Clone();
 
             toggleKey = config.HotkeyToggleKey;
             toggleModifiers = config.HotkeyToggleModifiers;
@@ -1304,7 +2076,7 @@ namespace MicMute
         private void InitializeComponents()
         {
             this.Text = Translations.SettingsTitle(config.AppLanguage);
-            this.Size = new Size(470, 540);
+            this.Size = new Size(470, 570);
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = false;
@@ -1313,13 +2085,13 @@ namespace MicMute
             tabControl = new TabControl
             {
                 Location = new Point(10, 10),
-                Size = new Size(435, 430)
+                Size = new Size(435, 460)
             };
 
             TabPage tabHotkeys = new TabPage(Translations.GlobalHotkeys(config.AppLanguage));
             TabPage tabGeneral = new TabPage(config.AppLanguage == Language.German ? "Allgemein" : "General");
 
-            GroupBox grpToggle = new GroupBox
+            grpToggle = new GroupBox
             {
                 Text = Translations.ToggleHotkey(config.AppLanguage),
                 Location = new Point(10, 10),
@@ -1362,7 +2134,7 @@ namespace MicMute
             grpToggle.Controls.Add(lblToggleHotkey);
             grpToggle.Controls.Add(txtToggleHotkey);
 
-            GroupBox grpMute = new GroupBox
+            grpMute = new GroupBox
             {
                 Text = Translations.MuteHotkey(config.AppLanguage),
                 Location = new Point(10, 120),
@@ -1405,7 +2177,7 @@ namespace MicMute
             grpMute.Controls.Add(lblMuteHotkey);
             grpMute.Controls.Add(txtMuteHotkey);
 
-            GroupBox grpUnmute = new GroupBox
+            grpUnmute = new GroupBox
             {
                 Text = Translations.UnmuteHotkey(config.AppLanguage),
                 Location = new Point(10, 230),
@@ -1448,7 +2220,7 @@ namespace MicMute
             grpUnmute.Controls.Add(lblUnmuteHotkey);
             grpUnmute.Controls.Add(txtUnmuteHotkey);
 
-            Label lblInfo = new Label
+            lblInfo = new Label
             {
                 Text = Translations.HotkeyInfo(config.AppLanguage),
                 Location = new Point(10, 340),
@@ -1575,10 +2347,28 @@ namespace MicMute
             grpDefaultState.Controls.Add(rbDefaultMuted);
             grpDefaultState.Controls.Add(rbDefaultUnmuted);
 
+            grpLogging = new GroupBox
+            {
+                Text = Translations.Logging(config.AppLanguage),
+                Location = new Point(10, 350),
+                Size = new Size(405, 55)
+            };
+
+            chkLogging = new CheckBox
+            {
+                Text = Translations.EnableLogging(config.AppLanguage),
+                Location = new Point(15, 22),
+                Size = new Size(370, 20),
+                Checked = config.LoggingEnabled
+            };
+
+            grpLogging.Controls.Add(chkLogging);
+
             tabGeneral.Controls.Add(grpClickBehavior);
             tabGeneral.Controls.Add(grpLanguage);
             tabGeneral.Controls.Add(grpAutostart);
             tabGeneral.Controls.Add(grpDefaultState);
+            tabGeneral.Controls.Add(grpLogging);
 
             tabControl.TabPages.Add(tabGeneral);
             tabControl.TabPages.Add(tabHotkeys);
@@ -1696,20 +2486,23 @@ namespace MicMute
             
             tabControl.TabPages.Add(tabAdvanced);
 
+            BuildAutomationTab();
+            tabControl.TabPages.Add(tabAutomation);
+
             btnOK = new Button
             {
-                Text = "OK",
+                Text = Translations.OK(config.AppLanguage),
                 DialogResult = DialogResult.OK,
-                Location = new Point(275, 450),
+                Location = new Point(275, 480),
                 Size = new Size(80, 30)
             };
             btnOK.Click += BtnOK_Click;
 
             btnCancel = new Button
             {
-                Text = "Cancel",
+                Text = Translations.Cancel(config.AppLanguage),
                 DialogResult = DialogResult.Cancel,
-                Location = new Point(365, 450),
+                Location = new Point(365, 480),
                 Size = new Size(80, 30)
             };
 
@@ -1725,6 +2518,282 @@ namespace MicMute
             UpdateHotkeyDisplay(txtPushToTalkHotkey, chkEnablePushToTalk.Checked, pushToTalkKey, pushToTalkModifiers);
         }
 
+        /// <summary>Eine Profilregel. ToString() liefert die Anzeige, Raw das Speicherformat.</summary>
+        private class ProfileEntry
+        {
+            public string App;
+            public string Mode;
+            public Language Lang;
+
+            public string Raw { get { return App + ":" + Mode; } }
+
+            public override string ToString()
+            {
+                string modeText;
+                if (Mode == "mute") modeText = Translations.ProfileModeMute(Lang);
+                else if (Mode == "unmute") modeText = Translations.ProfileModeUnmute(Lang);
+                else modeText = Translations.ProfileModePtt(Lang);
+
+                return App + "  →  " + modeText;
+            }
+        }
+
+        private void BuildAutomationTab()
+        {
+            tabAutomation = new TabPage(Translations.Automation(config.AppLanguage));
+
+            grpAutoLock = new GroupBox
+            {
+                Text = Translations.AutoMuteOnLock(config.AppLanguage),
+                Location = new Point(10, 10),
+                Size = new Size(405, 75)
+            };
+
+            chkAutoMuteOnLock = new CheckBox
+            {
+                Text = Translations.AutoMuteOnLock(config.AppLanguage),
+                Location = new Point(15, 22),
+                Size = new Size(370, 20),
+                Checked = config.AutoMuteOnLock
+            };
+
+            lblAutoLockDesc = new Label
+            {
+                Text = Translations.AutoMuteOnLockDescription(config.AppLanguage),
+                Location = new Point(15, 44),
+                Size = new Size(375, 25),
+                ForeColor = Color.Gray
+            };
+
+            grpAutoLock.Controls.Add(chkAutoMuteOnLock);
+            grpAutoLock.Controls.Add(lblAutoLockDesc);
+
+            grpLed = new GroupBox
+            {
+                Text = Translations.LedSync(config.AppLanguage),
+                Location = new Point(10, 95),
+                Size = new Size(405, 100)
+            };
+
+            chkLedSync = new CheckBox
+            {
+                Text = Translations.EnableLedSync(config.AppLanguage),
+                Location = new Point(15, 22),
+                Size = new Size(280, 20),
+                Checked = config.LedSyncEnabled
+            };
+            chkLedSync.CheckedChanged += delegate(object s, EventArgs e)
+            {
+                cmbLedKey.Enabled = chkLedSync.Checked;
+            };
+
+            cmbLedKey = new ComboBox
+            {
+                Location = new Point(300, 20),
+                Size = new Size(90, 21),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Enabled = config.LedSyncEnabled
+            };
+            cmbLedKey.Items.Add(Keys.Scroll);
+            cmbLedKey.Items.Add(Keys.NumLock);
+            cmbLedKey.Items.Add(Keys.CapsLock);
+            cmbLedKey.SelectedItem = config.LedSyncKey;
+            if (cmbLedKey.SelectedIndex < 0) cmbLedKey.SelectedIndex = 0;
+
+            lblLedWarning = new Label
+            {
+                Text = Translations.LedSyncWarning(config.AppLanguage),
+                Location = new Point(15, 48),
+                Size = new Size(375, 42),
+                ForeColor = Color.Gray
+            };
+
+            grpLed.Controls.Add(chkLedSync);
+            grpLed.Controls.Add(cmbLedKey);
+            grpLed.Controls.Add(lblLedWarning);
+
+            grpProfiles = new GroupBox
+            {
+                Text = Translations.AppProfiles(config.AppLanguage),
+                Location = new Point(10, 205),
+                Size = new Size(405, 195)
+            };
+
+            lblProfilesDesc = new Label
+            {
+                Text = Translations.AppProfilesDescription(config.AppLanguage),
+                Location = new Point(15, 20),
+                Size = new Size(375, 18),
+                ForeColor = Color.Gray
+            };
+
+            lstProfiles = new ListBox
+            {
+                Location = new Point(15, 42),
+                Size = new Size(245, 140)
+            };
+
+            cmbProfileApp = new ComboBox
+            {
+                Location = new Point(270, 42),
+                Size = new Size(120, 21),
+                DropDownStyle = ComboBoxStyle.DropDown
+            };
+            FillRunningApps();
+
+            cmbProfileMode = new ComboBox
+            {
+                Location = new Point(270, 70),
+                Size = new Size(120, 21),
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            FillProfileModes();
+
+            btnAddProfile = new Button
+            {
+                Text = Translations.Add(config.AppLanguage),
+                Location = new Point(270, 100),
+                Size = new Size(120, 26)
+            };
+            btnAddProfile.Click += BtnAddProfile_Click;
+
+            btnRemoveProfile = new Button
+            {
+                Text = Translations.Remove(config.AppLanguage),
+                Location = new Point(270, 132),
+                Size = new Size(120, 26)
+            };
+            btnRemoveProfile.Click += delegate(object s, EventArgs e)
+            {
+                if (lstProfiles.SelectedIndex >= 0)
+                {
+                    lstProfiles.Items.RemoveAt(lstProfiles.SelectedIndex);
+                }
+            };
+
+            grpProfiles.Controls.Add(lblProfilesDesc);
+            grpProfiles.Controls.Add(lstProfiles);
+            grpProfiles.Controls.Add(cmbProfileApp);
+            grpProfiles.Controls.Add(cmbProfileMode);
+            grpProfiles.Controls.Add(btnAddProfile);
+            grpProfiles.Controls.Add(btnRemoveProfile);
+
+            tabAutomation.Controls.Add(grpAutoLock);
+            tabAutomation.Controls.Add(grpLed);
+            tabAutomation.Controls.Add(grpProfiles);
+
+            LoadProfilesIntoList();
+        }
+
+        /// <summary>Laufende Anwendungen mit sichtbarem Fenster - spart das Tippen von Pfaden.</summary>
+        private void FillRunningApps()
+        {
+            string previous = cmbProfileApp.Text;
+            cmbProfileApp.Items.Clear();
+
+            try
+            {
+                var names = new List<string>();
+                foreach (Process p in Process.GetProcesses())
+                {
+                    using (p)
+                    {
+                        if (p.MainWindowHandle == IntPtr.Zero)
+                            continue;
+
+                        string name = p.ProcessName + ".exe";
+                        if (!names.Contains(name))
+                            names.Add(name);
+                    }
+                }
+
+                names.Sort(StringComparer.OrdinalIgnoreCase);
+                foreach (string n in names)
+                    cmbProfileApp.Items.Add(n);
+            }
+            catch (Exception ex)
+            {
+                Program.Log("FillRunningApps", ex);
+            }
+
+            cmbProfileApp.Text = previous;
+        }
+
+        private void FillProfileModes()
+        {
+            object selected = cmbProfileMode.SelectedIndex >= 0 ? cmbProfileMode.SelectedIndex : (object)0;
+
+            cmbProfileMode.Items.Clear();
+            cmbProfileMode.Items.Add(Translations.ProfileModeMute(config.AppLanguage));
+            cmbProfileMode.Items.Add(Translations.ProfileModeUnmute(config.AppLanguage));
+            cmbProfileMode.Items.Add(Translations.ProfileModePtt(config.AppLanguage));
+            cmbProfileMode.SelectedIndex = (int)selected;
+        }
+
+        private static string ModeFromIndex(int index)
+        {
+            if (index == 0) return "mute";
+            if (index == 1) return "unmute";
+            return "ptt";
+        }
+
+        private void BtnAddProfile_Click(object sender, EventArgs e)
+        {
+            string app = cmbProfileApp.Text.Trim();
+            if (app.Length == 0)
+                return;
+
+            // Doppelte Regeln für dieselbe App vermeiden - die letzte gewinnt sonst stillschweigend
+            for (int i = lstProfiles.Items.Count - 1; i >= 0; i--)
+            {
+                ProfileEntry existing = (ProfileEntry)lstProfiles.Items[i];
+                if (string.Equals(existing.App, app, StringComparison.OrdinalIgnoreCase))
+                {
+                    lstProfiles.Items.RemoveAt(i);
+                }
+            }
+
+            lstProfiles.Items.Add(new ProfileEntry
+            {
+                App = app,
+                Mode = ModeFromIndex(cmbProfileMode.SelectedIndex),
+                Lang = config.AppLanguage
+            });
+        }
+
+        private void LoadProfilesIntoList()
+        {
+            lstProfiles.Items.Clear();
+
+            if (string.IsNullOrEmpty(config.ProfileApps))
+                return;
+
+            foreach (string entry in config.ProfileApps.Split(';'))
+            {
+                string[] parts = entry.Split(':');
+                if (parts.Length != 2)
+                    continue;
+
+                string app = parts[0].Trim();
+                string mode = parts[1].Trim().ToLowerInvariant();
+
+                if (app.Length > 0 && (mode == "mute" || mode == "unmute" || mode == "ptt"))
+                {
+                    lstProfiles.Items.Add(new ProfileEntry { App = app, Mode = mode, Lang = config.AppLanguage });
+                }
+            }
+        }
+
+        private string ProfilesToString()
+        {
+            var parts = new List<string>();
+            foreach (object item in lstProfiles.Items)
+            {
+                parts.Add(((ProfileEntry)item).Raw);
+            }
+            return string.Join(";", parts.ToArray());
+        }
+
         private void UpdateLanguage(Language newLanguage)
         {
             config.AppLanguage = newLanguage;
@@ -1734,6 +2803,7 @@ namespace MicMute
             tabControl.TabPages[0].Text = newLanguage == Language.German ? "Allgemein" : "General";
             tabControl.TabPages[1].Text = Translations.GlobalHotkeys(newLanguage);
             tabControl.TabPages[2].Text = Translations.AdvancedSettings(newLanguage);
+            tabAutomation.Text = Translations.Automation(newLanguage);
 
             grpClickBehavior.Text = Translations.TrayIconClickBehavior(newLanguage);
             rbSingleClick.Text = Translations.SingleClickToggle(newLanguage);
@@ -1751,37 +2821,19 @@ namespace MicMute
             rbDefaultMuted.Text = Translations.MutedMicrophoneOff(newLanguage);
             rbDefaultUnmuted.Text = Translations.UnmutedMicrophoneOn(newLanguage);
 
-            foreach (Control tab in tabControl.TabPages[1].Controls)
-            {
-                GroupBox grp = tab as GroupBox;
-                if (grp != null)
-                {
-                    if (grp.Controls.Contains(chkEnableToggle))
-                    {
-                        grp.Text = Translations.ToggleHotkey(newLanguage);
-                        chkEnableToggle.Text = Translations.EnableHotkey(newLanguage);
-                        lblToggleHotkey.Text = Translations.Hotkey(newLanguage);
-                    }
-                    else if (grp.Controls.Contains(chkEnableMute))
-                    {
-                        grp.Text = Translations.MuteHotkey(newLanguage);
-                        chkEnableMute.Text = Translations.EnableHotkey(newLanguage);
-                        lblMuteHotkey.Text = Translations.Hotkey(newLanguage);
-                    }
-                    else if (grp.Controls.Contains(chkEnableUnmute))
-                    {
-                        grp.Text = Translations.UnmuteHotkey(newLanguage);
-                        chkEnableUnmute.Text = Translations.EnableHotkey(newLanguage);
-                        lblUnmuteHotkey.Text = Translations.Hotkey(newLanguage);
-                    }
-                }
-                
-                Label lbl = tab as Label;
-                if (lbl != null)
-                {
-                    lbl.Text = Translations.HotkeyInfo(newLanguage);
-                }
-            }
+            grpToggle.Text = Translations.ToggleHotkey(newLanguage);
+            chkEnableToggle.Text = Translations.EnableHotkey(newLanguage);
+            lblToggleHotkey.Text = Translations.Hotkey(newLanguage);
+
+            grpMute.Text = Translations.MuteHotkey(newLanguage);
+            chkEnableMute.Text = Translations.EnableHotkey(newLanguage);
+            lblMuteHotkey.Text = Translations.Hotkey(newLanguage);
+
+            grpUnmute.Text = Translations.UnmuteHotkey(newLanguage);
+            chkEnableUnmute.Text = Translations.EnableHotkey(newLanguage);
+            lblUnmuteHotkey.Text = Translations.Hotkey(newLanguage);
+
+            lblInfo.Text = Translations.HotkeyInfo(newLanguage);
 
             UpdateHotkeyDisplay(txtToggleHotkey, chkEnableToggle.Checked, toggleKey, toggleModifiers);
             UpdateHotkeyDisplay(txtMuteHotkey, chkEnableMute.Checked, muteKey, muteModifiers);
@@ -1800,6 +2852,46 @@ namespace MicMute
             chkShowToastOnUnmute.Text = Translations.ShowToastOnUnmute(newLanguage);
             chkShowToastOnStartup.Text = Translations.ShowToastOnStartup(newLanguage);
             chkShowToastOnPushToTalk.Text = Translations.ShowToastOnPushToTalk(newLanguage);
+
+            grpLogging.Text = Translations.Logging(newLanguage);
+            chkLogging.Text = Translations.EnableLogging(newLanguage);
+
+            grpAutoLock.Text = Translations.AutoMuteOnLock(newLanguage);
+            chkAutoMuteOnLock.Text = Translations.AutoMuteOnLock(newLanguage);
+            lblAutoLockDesc.Text = Translations.AutoMuteOnLockDescription(newLanguage);
+
+            grpLed.Text = Translations.LedSync(newLanguage);
+            chkLedSync.Text = Translations.EnableLedSync(newLanguage);
+            lblLedWarning.Text = Translations.LedSyncWarning(newLanguage);
+
+            grpProfiles.Text = Translations.AppProfiles(newLanguage);
+            lblProfilesDesc.Text = Translations.AppProfilesDescription(newLanguage);
+            btnAddProfile.Text = Translations.Add(newLanguage);
+            btnRemoveProfile.Text = Translations.Remove(newLanguage);
+            FillProfileModes();
+
+            // Die Anzeige der Profilregeln enthält übersetzte Modusnamen
+            foreach (object item in lstProfiles.Items)
+            {
+                ((ProfileEntry)item).Lang = newLanguage;
+            }
+            RefreshProfileList();
+
+            btnOK.Text = Translations.OK(newLanguage);
+            btnCancel.Text = Translations.Cancel(newLanguage);
+        }
+
+        private void RefreshProfileList()
+        {
+            int selected = lstProfiles.SelectedIndex;
+            var items = new object[lstProfiles.Items.Count];
+            lstProfiles.Items.CopyTo(items, 0);
+
+            lstProfiles.Items.Clear();
+            lstProfiles.Items.AddRange(items);
+
+            if (selected >= 0 && selected < lstProfiles.Items.Count)
+                lstProfiles.SelectedIndex = selected;
         }
 
         private void TxtHotkey_PreviewKeyDown(object sender, PreviewKeyDownEventArgs e)
@@ -1910,8 +3002,64 @@ namespace MicMute
             textBox.Text = hotkeyText;
         }
 
+        /// <summary>
+        /// Ein globaler Hotkey ohne Modifier schluckt diese Taste systemweit. Nur für
+        /// Tasten erlaubt, die beim Schreiben ohnehin nicht vorkommen.
+        /// </summary>
+        private static bool AllowsStandaloneKey(Keys key)
+        {
+            return (key >= Keys.F13 && key <= Keys.F24)
+                || key == Keys.Pause
+                || key == Keys.Scroll;
+        }
+
+        private bool ValidateHotkeys()
+        {
+            var active = new List<Keys>();
+
+            var candidates = new[]
+            {
+                new { On = chkEnableToggle.Checked,     Key = toggleKey,     Mod = toggleModifiers },
+                new { On = chkEnableMute.Checked,       Key = muteKey,       Mod = muteModifiers },
+                new { On = chkEnableUnmute.Checked,     Key = unmuteKey,     Mod = unmuteModifiers },
+                new { On = chkEnablePushToTalk.Checked, Key = pushToTalkKey, Mod = pushToTalkModifiers }
+            };
+
+            foreach (var c in candidates)
+            {
+                if (!c.On || c.Key == Keys.None)
+                    continue;
+
+                if (c.Mod == Keys.None && !AllowsStandaloneKey(c.Key))
+                {
+                    MessageBox.Show(Translations.HotkeyNeedsModifier(config.AppLanguage),
+                        "MicMute", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+
+                Keys combo = c.Key | c.Mod;
+                if (active.Contains(combo))
+                {
+                    MessageBox.Show(Translations.HotkeyDuplicate(config.AppLanguage),
+                        "MicMute", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+
+                active.Add(combo);
+            }
+
+            return true;
+        }
+
         private void BtnOK_Click(object sender, EventArgs e)
         {
+            if (!ValidateHotkeys())
+            {
+                // Dialog offen lassen, damit die Eingabe korrigiert werden kann
+                this.DialogResult = DialogResult.None;
+                return;
+            }
+
             config.HotkeyToggleEnabled = chkEnableToggle.Checked;
             config.HotkeyToggleKey = toggleKey;
             config.HotkeyToggleModifiers = toggleModifiers;
@@ -1939,7 +3087,13 @@ namespace MicMute
             config.UseDoubleClick = rbDoubleClick.Checked;
             config.AppLanguage = rbGerman.Checked ? Language.German : Language.English;
             config.AutostartEnabled = chkAutostart.Checked;
-            
+
+            config.LoggingEnabled = chkLogging.Checked;
+            config.AutoMuteOnLock = chkAutoMuteOnLock.Checked;
+            config.LedSyncEnabled = chkLedSync.Checked;
+            config.LedSyncKey = cmbLedKey.SelectedItem is Keys ? (Keys)cmbLedKey.SelectedItem : Keys.Scroll;
+            config.ProfileApps = ProfilesToString();
+
             Config.SetAutostart(config.AutostartEnabled);
         }
 
