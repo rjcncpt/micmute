@@ -1,7 +1,7 @@
 # MicMute 2
 
-**Version:** v2.1.1  
-**Letzte Änderung:** 10.02.2026  
+**Version:** v2.3.0  
+**Letzte Änderung:** 30.07.2026  
 **Autoren:** 
 - AveYo (Original, nicht mehr auf Github verfügbar)
 - rjcncpt (Verbesserungen)
@@ -14,12 +14,19 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 
 ## Funktionen
 - **System-Tray-Icon**: Zeigt an, ob das Mikrofon eingeschaltet oder stummgeschaltet ist
+- **Schnellschalter im Tray-Menü**: Statuszeile sowie Haken für Push-to-Talk, Benachrichtigungen, Stumm-bei-Sperre und Autostart
 - **Flexibles Klick-Verhalten**: Wähle zwischen Einfachklick oder Doppelklick zum Umschalten des Mikrofons
+- **Drei globale Hotkeys**: Getrennte Tastenkombinationen für Umschalten, Stummschalten und Einschalten
+- **Push-to-Talk**: Taste gedrückt halten öffnet das Mikrofon, Loslassen schaltet stumm
+- **App-Profile**: Eigenes Verhalten, solange eine bestimmte Anwendung im Vordergrund ist
+- **Stumm bei Sperre**: Schaltet beim Sperren von Windows stumm und stellt den vorherigen Zustand beim Entsperren wieder her
+- **Tastatur-LED**: Eine Tastatur-LED kann den Stummzustand anzeigen
+- **Toast-Benachrichtigungen**: Einzeln pro Ereignis konfigurierbar
+- **Autostart**: Optionaler Start mit Windows
+- **Protokollierung**: Ereignisse werden in `MicMuteLog.txt` geschrieben
 - **Mehrsprachigkeit**: Deutsch und Englisch mit Live-Sprachwechsel in den Einstellungen
-- **Globaler Hotkey**: Programmweit über eine definierbare Tastenkombination
 - **Default-State beim Start**: Option zum automatischen Setzen des Mikrofonzustandes beim Programmstart
 - **Automatische Zustandsspeicherung**: Der Mikrofonzustand und Einstellungen werden in einer Konfigurationsdatei gespeichert
-- **Kontextmenü**: Rechtsklick für zusätzliche Optionen (Mute/Unmute, Einstellungen, Beenden)
 
 <img width="446" height="518" alt="image" src="https://github.com/user-attachments/assets/f731d14e-5d72-4672-9205-720ad44d1f86" />
 
@@ -54,33 +61,79 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 4. **Ausführen:**
    - Starte **`MicMute2.exe`** aus **`C:\micmute\`**
    - Das Tray-Icon erscheint in der Taskleiste und zeigt den Mikrofonzustand an
-   - Wird der Zustand nicht korrekt angezeigt, zum Beispiel grünes Icon aber das Mikrofon ist ausgeschaltet:
-     - Klicke mit der rechten Maustaste auf das Tray-Icon
-     - Wähle "Einstellungen"
-     - Setze einen Haken bei "Mikrofon beim Start auf Standardstatus setzen" und wähle den Standardwert aus
-   - Das Klick-Verhalten (Einfachklick oder Doppelklick) kann ebenfalls in den Einstellungen konfiguriert werden
-   - Die Sprache kann zwischen Deutsch und Englisch gewechselt werden
+   - Der Zustand wird beim Start direkt vom Windows-Audiogerät gelesen. Das Icon stimmt also auch dann, wenn das Mikrofon von einem anderen Programm stummgeschaltet wurde
+   - Klick-Verhalten, Hotkeys, Sprache und sämtliche Automatik-Optionen lassen sich über **Einstellungen** konfigurieren
 
 ---
 
 ## Konfiguration
 ### Einstellungen
-Rechtsklick auf das Tray-Icon → **Einstellungen** öffnet den Konfigurationsdialog:
+Rechtsklick auf das Tray-Icon → **Einstellungen** öffnet den Konfigurationsdialog mit vier Registerkarten:
 
-- **Globaler Hotkey**: Aktiviere/Deaktiviere und definiere eine Tastenkombination
-- **Tray-Icon Klick-Verhalten**: Wähle zwischen Einfachklick oder Doppelklick
-- **Sprache**: Wähle zwischen Deutsch und Englisch
-- **Standard-Mikrofonstatus**: Lege fest, ob das Mikrofon beim Programmstart automatisch stumm oder aktiv sein soll
+| Registerkarte | Inhalt |
+|---|---|
+| **Allgemein** | Klick-Verhalten, Sprache, Autostart, Standard-Mikrofonstatus, Protokollierung |
+| **Globale Hotkeys** | Getrennte Kombinationen für Umschalten, Stummschalten und Einschalten |
+| **Erweitert** | Push-to-Talk, Toast-Benachrichtigungen je Ereignis |
+| **Automatik** | Stumm bei Sperre, Tastatur-LED, App-Profile |
+
+Ein globaler Hotkey braucht mindestens Strg, Umschalt oder Alt. Einzelne Tasten werden nur für F13-F24, Pause und Rollen angenommen, weil jede andere Einzeltaste systemweit geschluckt würde. Dieselbe Kombination kann nicht zweimal vergeben werden.
+
+### Tray-Menü
+Neben Stummschalten und Aktivieren bietet das Menü eine Statuszeile sowie Haken für Push-to-Talk, Toast-Benachrichtigungen, Stumm-bei-Sperre und Autostart, dazu einen Eintrag zum Öffnen der Protokolldatei. Jeder Haken wirkt sofort und wird sofort gespeichert.
+
+### App-Profile
+Ein App-Profil legt fest, wie sich das Mikrofon verhält, solange eine bestimmte Anwendung im Vordergrund ist:
+
+| Modus | Verhalten |
+|---|---|
+| `mute` | Mikrofon stumm |
+| `unmute` | Mikrofon aktiv |
+| `ptt` | Push-to-Talk aktiv, sonst stumm |
+
+Profile werden in der Registerkarte *Automatik* angelegt, die die aktuell laufenden Anwendungen zur Auswahl anbietet. In der Konfigurationsdatei stehen sie in einer Zeile:
+
+```
+PROFILE_APPS=discord.exe:ptt;obs64.exe:unmute;chrome.exe:mute
+```
+
+Beim Verlassen einer Profil-Anwendung wird der vorherige Mikrofonzustand wiederhergestellt.
+
+### Tastatur-LED
+Die LED leuchtet, solange das Mikrofon stumm ist. Wählbar sind Rollen, Num oder Feststell.
+
+> **Achtung:** damit wird nicht nur die Lampe geschaltet, sondern der echte Tastaturmodus. Rollen ist zum Beispiel in Excel funktional. Die Option ist deshalb standardmäßig aus.
 
 ### Konfigurationsdatei
-Der Mikrofonzustand und alle Einstellungen werden in **`C:\micmute\MicMuteConfig.txt`** gespeichert.
+Alle Einstellungen und der Mikrofonzustand werden in **`C:\micmute\MicMuteConfig.ini`** gespeichert.
+
+| Schlüssel | Standard | Bedeutung |
+|---|---|---|
+| `HOTKEY_TOGGLE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Hotkey Umschalten |
+| `HOTKEY_MUTE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Hotkey Stummschalten |
+| `HOTKEY_UNMUTE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Hotkey Einschalten |
+| `PUSH_TO_TALK_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Push-to-Talk |
+| `SHOW_TOAST_ON_TOGGLE` … `_PUSHTOTALK` | `False` | Benachrichtigung je Ereignis |
+| `USE_DEFAULT_STATE` / `DEFAULT_MUTED_STATE` | `True` / `True` | Zustand beim Start |
+| `USE_DOUBLE_CLICK` | `False` | Doppelklick statt Einfachklick |
+| `LANGUAGE` | `English` | `English` oder `German` |
+| `AUTOSTART_ENABLED` | `False` | Mit Windows starten |
+| `LOGGING_ENABLED` | `True` | `MicMuteLog.txt` schreiben |
+| `AUTO_MUTE_ON_LOCK` | `False` | Stumm beim Sperren von Windows |
+| `LED_SYNC_ENABLED` / `LED_SYNC_KEY` | `False` / `Scroll` | Tastatur-LED als Stummanzeige |
+| `PROFILE_APPS` | *(leer)* | App-Profile, siehe oben |
+| `MUTED` | — | Zuletzt gespeicherter Mikrofonzustand |
+
+Schlüssel, die eine Version nicht kennt, bleiben unverändert erhalten. Eine ältere Version kann die Konfiguration einer neueren damit nicht zerstören.
 
 ---
 
 ## Hinweise
-- **Icons**: Stelle sicher, dass `mic_on.ico` und `mic_off.ico` im Verzeichnis `C:\micmute\` vorhanden sind, da sie für das Tray-Icon benötigt werden
-- **Konfigurationsdatei**: Der Mikrofonzustand wird in **`C:\micmute\MicMuteConfig.txt`** gespeichert
+- **Icons**: Stelle sicher, dass `mic_on.ico` und `mic_off.ico` neben der ausführbaren Datei liegen, da sie für das Tray-Icon benötigt werden. Fehlen sie, weicht das Programm auf ein Systemsymbol aus, statt nicht zu starten
+- **Konfigurationsdatei**: `MicMuteConfig.ini`, liegt neben der ausführbaren Datei
+- **Protokolldatei**: `MicMuteLog.txt`, liegt neben der ausführbaren Datei und lässt sich über das Tray-Menü öffnen
 - **Sprachwechsel**: Die Sprache kann jederzeit in den Einstellungen geändert werden und wird sofort angewendet
+- **Nur eine Instanz**: Ein zweiter Start bewirkt nichts, die laufende Instanz behält ihre Hotkeys und ihr Tray-Icon
 
 ---
 
