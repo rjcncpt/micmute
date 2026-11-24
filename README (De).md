@@ -36,7 +36,7 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 ## Voraussetzungen
 - Windows (getestet unter Windows 10/11; kompatibel ab Windows Vista)
 - .NET Framework 4.0 oder höher
-- Zwei Icon-Dateien: `mic_on.ico` und `mic_off.ico` (müssen im gleichen Verzeichnis wie die ausführbare Datei liegen)
+- Zwei Icon-Dateien: `mic_on.ico` und `mic_off.ico` (werden beim Kompilieren benötigt und in die ausführbare Datei eingebettet)
 
 ---
 
@@ -46,14 +46,14 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
    - Entpacke die ZIP-Datei
    - Kopiere das micmute-Verzeichnis nach **`C:\`**
 
-2. **Icons bereitstellen:**
-   - Stelle sicher, dass die Dateien **`mic_on.ico`** und **`mic_off.ico`** im Verzeichnis **`C:\micmute\`** vorhanden sind
-   - Du kannst eigene Icons erstellen oder kostenlose Icons von Websites wie IconArchive verwenden
+2. **Icons bereitstellen (zum Kompilieren):**
+   - Stelle sicher, dass die Dateien **`mic_on.ico`** und **`mic_off.ico`** im Verzeichnis **`C:\micmute\`** vorhanden sind: sie werden beim Kompilieren in die ausführbare Datei eingebettet
+   - Du kannst eigene Icons erstellen oder kostenlose Icons von Websites wie IconArchive verwenden. Icon-Dateien neben der fertigen ausführbaren Datei ersetzen die eingebetteten (optional)
 
 3. **Kompilieren:**
    - Öffne eine Eingabeaufforderung (CMD) und führe den folgenden Befehl aus, um den Code zu kompilieren:
    ```
-   C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /out:"C:\micmute\MicMute2.exe" /target:winexe /platform:anycpu /optimize /nologo "C:\micmute\MicMute.cs"
+   C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /out:"C:\micmute\MicMute2.exe" /target:winexe /platform:anycpu /optimize /nologo /win32icon:C:\micmute\mic_on.ico /resource:C:\micmute\mic_on.ico,mic_on.ico /resource:C:\micmute\mic_off.ico,mic_off.ico "C:\micmute\MicMute.cs"
    ```
    - Dies erstellt die ausführbare Datei MicMute2.exe in **`C:\micmute\`**
    - Verschiebe nun den Ordner an einen Ort deiner Wahl
@@ -129,7 +129,8 @@ Schlüssel, die eine Version nicht kennt, bleiben unverändert erhalten. Eine ä
 ---
 
 ## Hinweise
-- **Icons**: Stelle sicher, dass `mic_on.ico` und `mic_off.ico` neben der ausführbaren Datei liegen, da sie für das Tray-Icon benötigt werden. Fehlen sie, weicht das Programm auf ein Systemsymbol aus, statt nicht zu starten
+- **Icons**: `mic_on.ico` und `mic_off.ico` sind in die ausführbare Datei eingebettet, eine einzelne `MicMute2.exe` genügt. Icon-Dateien neben der ausführbaren Datei haben Vorrang (eigene Icons). Fehlt beides, weicht das Programm auf ein Systemsymbol aus
+- **Alle Mikrofone**: Stummschalten wirkt auf alle aktiven Aufnahmegeräte, nicht nur auf das Standardgerät. Einschalten öffnet nur die Mikrofone, die vorher offen waren (ohne gemerkten Zustand: die Standardgeräte). Im stummen Zustand prüft MicMute alle 2 Sekunden, ob ein Mikrofon offen ist (z. B. ein neu verbundenes Bluetooth-Headset), und schaltet es stumm. Das Tray-Icon zeigt "stumm" nur, wenn alle bestätigt stumm sind
 - **Konfigurationsdatei**: `MicMuteConfig.ini`, liegt neben der ausführbaren Datei
 - **Protokolldatei**: `MicMuteLog.txt`, liegt neben der ausführbaren Datei und lässt sich über das Tray-Menü öffnen
 - **Sprachwechsel**: Die Sprache kann jederzeit in den Einstellungen geändert werden und wird sofort angewendet

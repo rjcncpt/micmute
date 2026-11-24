@@ -35,7 +35,7 @@ MicMute is a small Windows utility that allows you to quickly mute or unmute you
 ## Requirements
 - Windows (tested on Windows 10/11; compatible from Windows Vista)
 - .NET Framework 4.0 or higher
-- Two icon files: `mic_on.ico` and `mic_off.ico` (must be located in the same directory as the executable)
+- Two icon files: `mic_on.ico` and `mic_off.ico` (needed at compile time; they are embedded into the executable)
 
 ---
 
@@ -45,14 +45,14 @@ MicMute is a small Windows utility that allows you to quickly mute or unmute you
    - Extract the archive
    - Copy the `micmute` folder to **`C:\`**
 
-2. **Provide icons**
-   - Ensure the files **`mic_on.ico`** and **`mic_off.ico`** are located in **`C:\micmute\`**
-   - You can create your own icons or download free ones from sites such as IconArchive
+2. **Provide icons (for compiling)**
+   - Ensure the files **`mic_on.ico`** and **`mic_off.ico`** are located in **`C:\micmute\`**: they are embedded into the executable at compile time
+   - You can create your own icons or download free ones from sites such as IconArchive. Icon files placed next to the compiled executable override the embedded ones (optional)
 
 3. **Compile**
    - Open a Command Prompt (CMD) and run the following command to compile the code:
    ```
-   C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /out:"C:\micmute\MicMute2.exe" /target:winexe /platform:anycpu /optimize /nologo "C:\micmute\MicMute.cs"
+   C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /out:"C:\micmute\MicMute2.exe" /target:winexe /platform:anycpu /optimize /nologo /win32icon:C:\micmute\mic_on.ico /resource:C:\micmute\mic_on.ico,mic_on.ico /resource:C:\micmute\mic_off.ico,mic_off.ico "C:\micmute\MicMute.cs"
    ```
    - This creates the executable **MicMute2.exe** in **`C:\micmute\`**
    - You may then move the folder to a location of your choice
@@ -128,7 +128,8 @@ Keys that a given version does not recognise are preserved unchanged, so an olde
 ---
 
 ## Notes
-- **Icons**: Ensure `mic_on.ico` and `mic_off.ico` are present next to the executable, as they are required for the tray icon. If they are missing, the application falls back to a system icon instead of failing to start
+- **Icons**: `mic_on.ico` and `mic_off.ico` are embedded into the executable, so a single `MicMute2.exe` is enough. Icon files placed next to the executable take precedence (custom icons). If neither is available, the application falls back to a system icon
+- **All microphones**: Muting applies to every active recording device, not only the default one. Unmuting reopens only the microphones that were open before (without remembered state: the default devices). While muted, MicMute checks every 2 seconds for an open microphone (e.g. a newly connected Bluetooth headset) and mutes it. The tray icon shows "muted" only when all of them are confirmed muted
 - **Configuration file**: `MicMuteConfig.ini`, stored next to the executable
 - **Log file**: `MicMuteLog.txt`, stored next to the executable, can be opened from the tray menu
 - **Language switching**: The language can be changed at any time in settings and is applied immediately
