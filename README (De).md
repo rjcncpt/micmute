@@ -17,7 +17,7 @@ MicMute ist ein kleines Windows-Tool, das es ermöglicht, das Mikrofon per Syste
 - **Schnellschalter im Tray-Menü**: Statuszeile sowie Haken für Push-to-Talk, Benachrichtigungen, Stumm-bei-Sperre und Autostart
 - **Flexibles Klick-Verhalten**: Wähle zwischen Einfachklick oder Doppelklick zum Umschalten des Mikrofons
 - **Drei globale Hotkeys**: Getrennte Tastenkombinationen für Umschalten, Stummschalten und Einschalten
-- **Push-to-Talk**: Taste gedrückt halten öffnet das Mikrofon, Loslassen schaltet stumm
+- **Push-to-Talk**: Eine der eingestellten Tasten gedrückt halten öffnet das Mikrofon, Loslassen schaltet stumm. Beliebig viele Tasten möglich (z. B. Zusatztaste der Bürotastatur und eine, die es auch zu Hause gibt); solange Push-to-Talk aktiv ist, wirken diese Tasten nur als Push-to-Talk
 - **App-Profile**: Eigenes Verhalten, solange eine bestimmte Anwendung im Vordergrund ist
 - **Stumm bei Sperre**: Schaltet beim Sperren von Windows stumm und stellt den vorherigen Zustand beim Entsperren wieder her
 - **Tastatur-LED**: Eine Tastatur-LED kann den Stummzustand anzeigen
@@ -77,7 +77,7 @@ Rechtsklick auf das Tray-Icon → **Einstellungen** öffnet den Konfigurationsdi
 | **Erweitert** | Push-to-Talk, Toast-Benachrichtigungen je Ereignis |
 | **Automatik** | Stumm bei Sperre, Tastatur-LED, App-Profile |
 
-Ein globaler Hotkey braucht mindestens Strg, Umschalt oder Alt. Einzelne Tasten werden nur für F13-F24, Pause und Rollen angenommen, weil jede andere Einzeltaste systemweit geschluckt würde. Dieselbe Kombination kann nicht zweimal vergeben werden.
+Ein globaler Hotkey braucht mindestens Strg, Umschalt oder Alt. Einzelne Tasten werden nur für F13-F24, Pause und Rollen angenommen, weil jede andere Einzeltaste systemweit geschluckt würde. Dieselbe Kombination kann nicht zweimal vergeben werden. Push-to-Talk-Tasten laufen über einen Tastatur-Hook und erlauben jede Taste, auch ohne Modifier. Solange Push-to-Talk aktiv ist, hat eine Push-to-Talk-Taste keine andere Funktion: Windows und andere Programme sehen sie nicht (z. B. funktionieren F12 oder Eingabe nicht mehr normal, ein Buchstabe lässt sich nicht mehr tippen). Bei einer Kombination wie Strg+F12 wird nur F12 gesperrt, F12 allein funktioniert weiter; eine Push-to-Talk-Taste ohne Modifier wird auch zusammen mit Strg/Umschalt/Alt gesperrt (z. B. sperrt F12 auch Strg+F12), deshalb kann sie ihre Taste nicht mit einem MicMute-Hotkey teilen. Ist Push-to-Talk aus oder nur über ein App-Profil aktiv und die App nicht im Vordergrund, funktioniert die Taste normal. Tasten, die nur die Herstellersoftware kennt, und die Fn-Taste sieht Windows nicht; mit dieser Software umbelegen (z. B. auf F13-F24).
 
 ### Tray-Menü
 Neben Stummschalten und Aktivieren bietet das Menü eine Statuszeile sowie Haken für Push-to-Talk, Toast-Benachrichtigungen, Stumm-bei-Sperre und Autostart, dazu einen Eintrag zum Öffnen der Protokolldatei. Jeder Haken wirkt sofort und wird sofort gespeichert.
@@ -112,7 +112,8 @@ Alle Einstellungen und der Mikrofonzustand werden in **`C:\micmute\MicMuteConfig
 | `HOTKEY_TOGGLE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Hotkey Umschalten |
 | `HOTKEY_MUTE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Hotkey Stummschalten |
 | `HOTKEY_UNMUTE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Hotkey Einschalten |
-| `PUSH_TO_TALK_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Push-to-Talk |
+| `PUSH_TO_TALK_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Push-to-Talk (erste Taste) |
+| `PUSH_TO_TALK_EXTRA_KEYS` | *(leer)* | Weitere Push-to-Talk-Tasten, `Taste\|Modifier;…` z. B. `F14\|None;LaunchApplication1\|Control`. Eine linke/rechte Modifier-Taste (z. B. `RControlKey`) ist als Push-to-Talk-Taste nur über diese Datei möglich (sie wird dann ebenfalls gesperrt, z. B. funktioniert die rechte Strg-Taste nicht mehr, solange Push-to-Talk aktiv ist; nicht zusammen mit der Copilot-Taste empfohlen) |
 | `SHOW_TOAST_ON_TOGGLE` … `_PUSHTOTALK` | `False` | Benachrichtigung je Ereignis |
 | `USE_DEFAULT_STATE` / `DEFAULT_MUTED_STATE` | `True` / `True` | Zustand beim Start |
 | `USE_DOUBLE_CLICK` | `False` | Doppelklick statt Einfachklick |
@@ -135,6 +136,7 @@ Schlüssel, die eine Version nicht kennt, bleiben unverändert erhalten. Eine ä
 - **Protokolldatei**: `MicMuteLog.txt`, liegt neben der ausführbaren Datei und lässt sich über das Tray-Menü öffnen
 - **Sprachwechsel**: Die Sprache kann jederzeit in den Einstellungen geändert werden und wird sofort angewendet
 - **Nur eine Instanz**: Ein zweiter Start bewirkt nichts, die laufende Instanz behält ihre Hotkeys und ihr Tray-Icon
+- **Copilot-Taste**: Windows 11 sendet sie als LWin + LShift + F23. Als Push-to-Talk-Taste hinzufügen (das Feld in den Einstellungen erfasst sie als `F23`; sonst in der INI `PUSH_TO_TALK_KEY=F23` setzen oder `F23|None` an `PUSH_TO_TALK_EXTRA_KEYS` anhängen). Wie jede Push-to-Talk-Taste wird sie gesperrt, solange Push-to-Talk aktiv ist, damit Suche/Copilot und Startmenü nicht aufgehen. Solange die Taste gehalten wird, hält Windows Win und Umschalt für gedrückt: andere Tasten wirken in dieser Zeit als Win+Umschalt-Tastenkombinationen. Umschalt nicht als Push-to-Talk-Taste zusammen mit der Copilot-Taste verwenden
 
 ---
 
