@@ -17,7 +17,7 @@ MicMute is a small Windows utility that allows you to quickly mute or unmute you
 - **Quick switches in the tray menu**: Status line plus one-click toggles for push-to-talk, notifications, mute-on-lock and autostart
 - **Flexible click behavior**: Choose between single-click or double-click to toggle the microphone
 - **Three global hotkeys**: Separate combinations for toggle, mute and unmute
-- **Push-to-talk**: Hold a key to open the microphone, release to mute
+- **Push-to-talk**: Hold one of the configured keys to open the microphone, release to mute. Any number of keys can be assigned (e.g. an extra key on the office keyboard and one available at home); while push-to-talk is active, these keys only act as push-to-talk
 - **App profiles**: Per-application behaviour while that application is in the foreground
 - **Mute on lock**: Mutes on Windows lock and restores the previous state on unlock
 - **Keyboard LED**: A keyboard LED can indicate the muted state
@@ -35,7 +35,7 @@ MicMute is a small Windows utility that allows you to quickly mute or unmute you
 ## Requirements
 - Windows (tested on Windows 10/11; compatible from Windows Vista)
 - .NET Framework 4.0 or higher
-- Two icon files: `mic_on.ico` and `mic_off.ico` (must be located in the same directory as the executable)
+- Two icon files: `mic_on.ico` and `mic_off.ico` (needed at compile time; they are embedded into the executable)
 
 ---
 
@@ -45,14 +45,14 @@ MicMute is a small Windows utility that allows you to quickly mute or unmute you
    - Extract the archive
    - Copy the `micmute` folder to **`C:\`**
 
-2. **Provide icons**
-   - Ensure the files **`mic_on.ico`** and **`mic_off.ico`** are located in **`C:\micmute\`**
-   - You can create your own icons or download free ones from sites such as IconArchive
+2. **Provide icons (for compiling)**
+   - Ensure the files **`mic_on.ico`** and **`mic_off.ico`** are located in **`C:\micmute\`**: they are embedded into the executable at compile time
+   - You can create your own icons or download free ones from sites such as IconArchive. Icon files placed next to the compiled executable override the embedded ones (optional)
 
 3. **Compile**
    - Open a Command Prompt (CMD) and run the following command to compile the code:
    ```
-   C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /out:"C:\micmute\MicMute2.exe" /target:winexe /platform:anycpu /optimize /nologo "C:\micmute\MicMute.cs"
+   C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /out:"C:\micmute\MicMute2.exe" /target:winexe /platform:anycpu /optimize /nologo /win32icon:C:\micmute\mic_on.ico /resource:C:\micmute\mic_on.ico,mic_on.ico /resource:C:\micmute\mic_off.ico,mic_off.ico "C:\micmute\MicMute.cs"
    ```
    - This creates the executable **MicMute2.exe** in **`C:\micmute\`**
    - You may then move the folder to a location of your choice
@@ -76,7 +76,7 @@ Right-click the tray icon → **Settings** opens the configuration dialog with f
 | **Advanced** | Push-to-talk, toast notifications per event |
 | **Automation** | Mute on lock, keyboard LED, app profiles |
 
-A global hotkey requires at least Ctrl, Shift or Alt. Standalone keys are only accepted for F13-F24, Pause and Scroll Lock, because any other single key would be swallowed system-wide. The same combination cannot be assigned to two actions.
+A global hotkey requires at least Ctrl, Shift or Alt. Standalone keys are only accepted for F13-F24, Pause and Scroll Lock, because any other single key would be swallowed system-wide. The same combination cannot be assigned to two actions. Push-to-talk keys are read through a keyboard hook and accept any key, also without modifiers. While push-to-talk is active, a push-to-talk key does nothing else: Windows and other apps do not see it (e.g. F12 or Enter stop working normally, a letter can no longer be typed). With a combination such as Ctrl+F12 only F12 is blocked, and F12 alone keeps working; a push-to-talk key without modifiers is blocked also together with Ctrl/Shift/Alt (e.g. F12 also blocks Ctrl+F12), so it cannot share its key with a MicMute hotkey. While push-to-talk is off, or only enabled by an app profile and that app is not in the foreground, the key works normally. Keys handled only by the manufacturer's software (vendor HID keys) and the Fn key are invisible to Windows; remap them (e.g. to F13-F24) with that software.
 
 ### Tray menu
 Beyond mute/unmute the menu offers a status line and quick switches for push-to-talk, toast notifications, mute-on-lock and autostart, plus an entry to open the log file. Each switch takes effect and is saved immediately.
@@ -111,7 +111,8 @@ All settings and the microphone state are stored in **`C:\micmute\MicMuteConfig.
 | `HOTKEY_TOGGLE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Toggle hotkey |
 | `HOTKEY_MUTE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Mute hotkey |
 | `HOTKEY_UNMUTE_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Unmute hotkey |
-| `PUSH_TO_TALK_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Push-to-talk |
+| `PUSH_TO_TALK_ENABLED` / `_KEY` / `_MODIFIERS` | `False` / `None` / `None` | Push-to-talk (first key) |
+| `PUSH_TO_TALK_EXTRA_KEYS` | *(empty)* | Further push-to-talk keys, `Key\|Modifiers;…` e.g. `F14\|None;LaunchApplication1\|Control`. A left/right modifier key (e.g. `RControlKey`) can be used as push-to-talk key only through this file (it is then blocked as well, e.g. right Ctrl stops working while push-to-talk is active; not recommended together with the Copilot key) |
 | `SHOW_TOAST_ON_TOGGLE` … `_PUSHTOTALK` | `False` | Notification per event |
 | `USE_DEFAULT_STATE` / `DEFAULT_MUTED_STATE` | `True` / `True` | State on startup |
 | `USE_DOUBLE_CLICK` | `False` | Double-click instead of single-click |
@@ -128,11 +129,13 @@ Keys that a given version does not recognise are preserved unchanged, so an olde
 ---
 
 ## Notes
-- **Icons**: Ensure `mic_on.ico` and `mic_off.ico` are present next to the executable, as they are required for the tray icon. If they are missing, the application falls back to a system icon instead of failing to start
+- **Icons**: `mic_on.ico` and `mic_off.ico` are embedded into the executable, so a single `MicMute2.exe` is enough. Icon files placed next to the executable take precedence (custom icons). If neither is available, the application falls back to a system icon
+- **All microphones**: Muting applies to every active recording device, not only the default one. Unmuting reopens only the microphones that were open before (without remembered state: the default devices). While muted, MicMute checks every 2 seconds for an open microphone (e.g. a newly connected Bluetooth headset) and mutes it. The tray icon shows "muted" only when all of them are confirmed muted
 - **Configuration file**: `MicMuteConfig.ini`, stored next to the executable
 - **Log file**: `MicMuteLog.txt`, stored next to the executable, can be opened from the tray menu
 - **Language switching**: The language can be changed at any time in settings and is applied immediately
 - **Single instance**: Starting the application a second time does nothing; the running instance keeps its hotkeys and tray icon
+- **Copilot key**: Windows 11 sends it as LWin + LShift + F23. Add it as a push-to-talk key (the settings field records it as `F23`; otherwise set `PUSH_TO_TALK_KEY=F23` or append `F23|None` to `PUSH_TO_TALK_EXTRA_KEYS` in the ini). Like every push-to-talk key it is blocked while push-to-talk is active, so Search/Copilot and the Start menu do not open. While the key is held, Windows considers Win and Shift pressed: other keys pressed meanwhile act as Win+Shift shortcuts. Do not use Shift as a push-to-talk key together with the Copilot key
 
 ---
 

@@ -108,9 +108,58 @@ namespace MicMute
         private static extern short GetKeyState(int nVirtKey);
 
         [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll")]
         private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
         private const uint KEYEVENTF_KEYUP = 0x0002;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT
+        {
+            public uint type;
+            public InputUnion u;
+        }
+
+        // MOUSEINPUT nur für die richtige Größe der Union (x64: 40 Byte)
+        [StructLayout(LayoutKind.Explicit)]
+        private struct InputUnion
+        {
+            [FieldOffset(0)] public MOUSEINPUT mi;
+            [FieldOffset(0)] public KEYBDINPUT ki;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        private const uint INPUT_KEYBOARD = 1;
+        /// <summary>Nicht belegter virtueller Tastencode, verhindert das Startmenü nach Win.</summary>
+        private const ushort VK_MENU_MASK = 0xE8;
+        /// <summary>Kennung eigener eingeschobener Tastenereignisse (dwExtraInfo), die der Hook übergeht.</summary>
+        private static readonly IntPtr InjectTag = new IntPtr(0x4D4D5554);
+        private static readonly UIntPtr InjectTagU = new UIntPtr(0x4D4D5554);
 
         /// <summary>
         /// Spiegelt den Mute-Status auf eine Tastatur-LED: LED an bedeutet stumm.
@@ -132,8 +181,9 @@ namespace MicMute
 
                 if (ledOn != muted)
                 {
-                    keybd_event(vk, 0, 0, UIntPtr.Zero);
-                    keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                    // Markiert, damit der Push-to-Talk-Hook die LED-Taste nicht als Tastendruck wertet
+                    keybd_event(vk, 0, 0, InjectTagU);
+                    keybd_event(vk, 0, KEYEVENTF_KEYUP, InjectTagU);
                 }
             }
             catch (Exception ex)
@@ -152,7 +202,18 @@ namespace MicMute
 
         private static IntPtr hookID = IntPtr.Zero;
         private static LowLevelKeyboardProc hookCallback;
-        private static bool pushToTalkActive = false;
+        /// <summary>
+        /// Gehaltene Push-to-Talk-Tasten mit dem Zeitpunkt (Environment.TickCount) ihres letzten
+        /// Ereignisses. Mikrofon offen, solange mindestens eine gehalten wird. Alle sind gesperrt.
+        /// </summary>
+        private static readonly Dictionary<Keys, int> pushToTalkHeld = new Dictionary<Keys, int>();
+        /// <summary>
+        /// Ohne Ereignis seit dieser Zeit gilt eine gehaltene Taste als losgelassen (KeyUp verpasst).
+        /// Autorepeat meldet sich spätestens nach 1 s Verzögerung, danach in kürzeren Abständen.
+        /// </summary>
+        private const int PushToTalkStaleMs = 1500;
+        /// <summary>Während der Einstellungsdialog offen ist: kein Push-to-Talk, nichts sperren (Tastenerfassung).</summary>
+        private static bool settingsOpen = false;
 
         private static IntPtr winEventHook = IntPtr.Zero;
         private static WinEventDelegate winEventCallback;
@@ -353,6 +414,8 @@ namespace MicMute
         private const int CLSCTX_ALL = 0x17;
         private const int eCapture = 1;
         private const int eConsole = 0;
+        private const int eCommunications = 2;
+        private const int DEVICE_STATE_ACTIVE = 0x1;
 
         private static readonly Guid CLSID_MMDeviceEnumerator = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
         private static readonly Guid IID_IMMDeviceEnumerator = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
@@ -381,7 +444,7 @@ namespace MicMute
             if (hookID != IntPtr.Zero)
                 return;
 
-            if (config.PushToTalkKey == Keys.None)
+            if (!config.HasPushToTalkKey)
                 return;
 
             // Der Hook wird auch gebraucht, wenn Push-to-Talk nicht global aktiv ist,
@@ -405,6 +468,9 @@ namespace MicMute
                 UnhookWindowsHookEx(hookID);
                 hookID = IntPtr.Zero;
             }
+
+            // Ohne Hook kommt kein Loslassen mehr an
+            ReleaseHeldPushToTalkKeys();
         }
 
         private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -413,26 +479,59 @@ namespace MicMute
             // verzögert systemweit jeden Tastendruck; überschreitet es
             // LowLevelHooksTimeout, entfernt Windows den Hook kommentarlos.
             // Deshalb hier nur den Zustand ermitteln und die Arbeit auf den UI-Thread posten.
-            if (nCode >= 0 && config != null && (config.PushToTalkEnabled || profilePushToTalk) && config.PushToTalkKey != Keys.None)
+            // Eigene eingeschobene Ereignisse (Maskentaste, LED-Sync) unverändert durchreichen;
+            // während die Einstellungen offen sind, erreicht jede Taste das Erfassungsfeld
+            if (nCode >= 0 && config != null && !settingsOpen && Marshal.ReadIntPtr(lParam, 16) != InjectTag)
             {
                 Keys key = (Keys)Marshal.ReadInt32(lParam);
+                bool isKeyDown = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN);
+                bool isKeyUp = (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP);
+                bool active = (config.PushToTalkEnabled || profilePushToTalk) && config.HasPushToTalkKey;
+                bool block = false;
 
-                if (key == config.PushToTalkKey && CheckModifiers(config.PushToTalkModifiers))
+                if (isKeyUp && pushToTalkHeld.Remove(key))
                 {
-                    bool isKeyDown = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN);
-                    bool isKeyUp = (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP);
-
-                    if (isKeyDown && !pushToTalkActive)
-                    {
-                        pushToTalkActive = true;
-                        PostToUi(false, MuteSource.PushToTalk);
-                    }
-                    else if (isKeyUp && pushToTalkActive)
-                    {
-                        pushToTalkActive = false;
+                    // Loslassen ohne Modifier-Prüfung: die Copilot-Taste lässt F23 erst nach
+                    // Win und Shift los, und wer Strg vor der Taste loslässt, darf das Mikrofon
+                    // nicht offen zurücklassen. Bei mehreren Tasten schaltet erst die zuletzt
+                    // losgelassene stumm. Auch gesperrt, wenn Push-to-Talk inzwischen aus ist.
+                    block = true;
+                    if (active && pushToTalkHeld.Count == 0)
                         PostToUi(true, MuteSource.PushToTalk);
-                    }
                 }
+                else if (isKeyDown && pushToTalkHeld.ContainsKey(key))
+                {
+                    // Autorepeat (Copilot-Taste: ganze Folge LWin, LShift, F23 alle ~31 ms).
+                    // Lange kein Ereignis: KeyUp verpasst, das ist ein neuer Druck - Mikrofon öffnen.
+                    int now = Environment.TickCount;
+                    RemoveStalePushToTalkKeys(key, now);
+                    if (active && unchecked(now - pushToTalkHeld[key]) > PushToTalkStaleMs)
+                        PostToUi(false, MuteSource.PushToTalk);
+                    pushToTalkHeld[key] = now;
+                    block = true;
+                }
+                else if (isKeyDown && active && IsPushToTalkCombo(key))
+                {
+                    int now = Environment.TickCount;
+                    RemoveStalePushToTalkKeys(key, now);
+
+                    pushToTalkHeld[key] = now;
+                    if (pushToTalkHeld.Count == 1)
+                        PostToUi(false, MuteSource.PushToTalk);
+
+                    // Jede Push-to-Talk-Taste ist gesperrt: sie wirkt nur noch als Push-to-Talk.
+                    block = true;
+
+                    // Win (Copilot-Taste = LWin + LShift + F23), Alt, Strg oder Umschalt allein losgelassen
+                    // öffnen Startmenü, Menüleiste bzw. wechseln das Tastaturlayout: unbelegte Taste einschieben.
+                    if (IsKeyDownNow(Keys.LWin) || IsKeyDownNow(Keys.RWin) || IsKeyDownNow(Keys.Menu)
+                        || IsKeyDownNow(Keys.ControlKey) || IsKeyDownNow(Keys.ShiftKey))
+                        InjectMenuMaskKey();
+                }
+
+                // Gesperrt: weder Windows noch andere Programme sehen die Taste
+                if (block)
+                    return (IntPtr)1;
             }
             return CallNextHookEx(hookID, nCode, wParam, lParam);
         }
@@ -460,17 +559,82 @@ namespace MicMute
         }
 
         /// <summary>
+        /// Asynchroner Tastenzustand. Im Tastatur-Hook verlässlicher als Control.ModifierKeys,
+        /// das den Zustand der eigenen Nachrichtenschlange liest.
+        /// </summary>
+        internal static bool IsKeyDownNow(Keys key)
+        {
+            return (GetAsyncKeyState((int)key) & 0x8000) != 0;
+        }
+
+        private static bool IsPushToTalkCombo(Keys key)
+        {
+            foreach (HotkeyBinding b in config.PushToTalkKeys)
+            {
+                if (b.Key == key && CheckModifiers(b.Modifiers))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Verlorene KeyUps aufräumen (z. B. Sperrbildschirm). GetAsyncKeyState hilft nicht, gesperrte
+        /// Tasten sieht Windows nie. Eine gehaltene Taste meldet sich per Autorepeat; ohne Ereignis seit
+        /// PushToTalkStaleMs gilt sie als losgelassen.
+        /// </summary>
+        private static void RemoveStalePushToTalkKeys(Keys except, int now)
+        {
+            List<Keys> stale = pushToTalkHeld
+                .Where(p => p.Key != except && unchecked(now - p.Value) > PushToTalkStaleMs)
+                .Select(p => p.Key)
+                .ToList();
+            foreach (Keys k in stale)
+                pushToTalkHeld.Remove(k);
+        }
+
+        /// <summary>Vergisst gehaltene Push-to-Talk-Tasten; hatte Push-to-Talk das Mikrofon geöffnet, wieder schließen.</summary>
+        private static void ReleaseHeldPushToTalkKeys()
+        {
+            // PostToUi statt direktem Aufruf, damit ein noch wartendes "öffnen" aus dem Hook nicht danach läuft.
+            if (pushToTalkHeld.Count > 0)
+            {
+                pushToTalkHeld.Clear();
+                PostToUi(true, MuteSource.PushToTalk);
+            }
+        }
+
+        /// <summary>
+        /// Schiebt eine unbelegte Taste ein, solange Win, Alt, Strg oder Umschalt gedrückt ist.
+        /// Sonst öffnet Windows beim Loslassen das Startmenü, aktiviert die Menüleiste bzw.
+        /// wechselt das Tastaturlayout, weil es die gesperrte Taste nie gesehen hat.
+        /// </summary>
+        private static void InjectMenuMaskKey()
+        {
+            INPUT[] inputs = new INPUT[2];
+            for (int i = 0; i < inputs.Length; i++)
+            {
+                inputs[i].type = INPUT_KEYBOARD;
+                inputs[i].u.ki.wVk = VK_MENU_MASK;
+                inputs[i].u.ki.dwFlags = (i == 0) ? 0u : KEYEVENTF_KEYUP;
+                inputs[i].u.ki.dwExtraInfo = InjectTag;
+            }
+
+            if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT))) != inputs.Length)
+                Log("Push-to-Talk: Maskentaste konnte nicht gesendet werden");
+        }
+
+        /// <summary>
         /// Prüft, ob die geforderten Modifier gedrückt sind. Zusätzlich gedrückte
         /// Modifier stören bewusst nicht - sonst bricht Push-to-Talk, sobald man
         /// nebenbei Shift oder Strg hält (Sprint-Taste in Spielen).
         /// </summary>
         private static bool CheckModifiers(Keys modifiers)
         {
-            if ((modifiers & Keys.Control) == Keys.Control && (Control.ModifierKeys & Keys.Control) != Keys.Control)
+            if ((modifiers & Keys.Control) == Keys.Control && !IsKeyDownNow(Keys.ControlKey))
                 return false;
-            if ((modifiers & Keys.Shift) == Keys.Shift && (Control.ModifierKeys & Keys.Shift) != Keys.Shift)
+            if ((modifiers & Keys.Shift) == Keys.Shift && !IsKeyDownNow(Keys.ShiftKey))
                 return false;
-            if ((modifiers & Keys.Alt) == Keys.Alt && (Control.ModifierKeys & Keys.Alt) != Keys.Alt)
+            if ((modifiers & Keys.Alt) == Keys.Alt && !IsKeyDownNow(Keys.Menu))
                 return false;
 
             return true;
@@ -511,6 +675,8 @@ namespace MicMute
 
                     // SystemEvents hält sonst eine statische Referenz auf den Handler
                     RemoveSessionSwitchHandler();
+
+                    StopMuteGuard();
                 }
             }
         }
@@ -519,20 +685,35 @@ namespace MicMute
         {
             // Fix: Get the directory where the .exe is located
             string appDir = Path.GetDirectoryName(Application.ExecutablePath);
-            string mutedPath = Path.Combine(appDir, "mic_off.ico");
-            string unmutedPath = Path.Combine(appDir, "mic_on.ico");
+            iconMuted = LoadIconFile(appDir, "mic_off.ico", SystemIcons.Shield);
+            iconUnmuted = LoadIconFile(appDir, "mic_on.ico", SystemIcons.Information);
+        }
 
-            try 
+        /// <summary>
+        /// Datei neben der exe hat Vorrang (eigene Icons), sonst die eingebettete
+        /// Ressource (/resource beim Kompilieren), sonst das Systemsymbol.
+        /// </summary>
+        private static Icon LoadIconFile(string appDir, string fileName, Icon fallback)
+        {
+            try
             {
-                iconMuted = File.Exists(mutedPath) ? new Icon(mutedPath) : SystemIcons.Shield;
+                string path = Path.Combine(appDir, fileName);
+                if (File.Exists(path))
+                    return new Icon(path);
             }
-            catch { iconMuted = SystemIcons.Shield; }
+            catch (Exception ex) { Log("LoadIconFile " + fileName, ex); }
 
             try
             {
-                iconUnmuted = File.Exists(unmutedPath) ? new Icon(unmutedPath) : SystemIcons.Information;
+                using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(fileName))
+                {
+                    if (stream != null)
+                        return new Icon(stream);
+                }
             }
-            catch { iconUnmuted = SystemIcons.Information; }
+            catch (Exception ex) { Log("LoadIconFile (Ressource) " + fileName, ex); }
+
+            return fallback;
         }
 
         private static void RunApp()
@@ -643,6 +824,7 @@ namespace MicMute
             {
                 Log("=== MicMute beendet ===");
                 UnregisterAllHotkeys();
+                StopMuteGuard();
                 if (hotkeyWindow != null) hotkeyWindow.Close();
                 Application.Exit();
             };
@@ -679,7 +861,7 @@ namespace MicMute
 
             if (config.ShowToastOnStartup)
             {
-                string statusText = isMuted ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage);
+                string statusText = (isMuted && !muteIncomplete) ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage);
                 ShowNotification(string.Format("MicMute gestartet - Mikrofon: {0}", statusText));
             }
 
@@ -697,6 +879,11 @@ namespace MicMute
             }
 
             SetupSessionSwitchHandler();
+
+            muteGuardTimer = new System.Windows.Forms.Timer();
+            muteGuardTimer.Interval = 2000;
+            muteGuardTimer.Tick += MuteGuardTick;
+            UpdateMuteGuardTimer();
 
             GC.KeepAlive(hookCallback);
 
@@ -735,7 +922,19 @@ namespace MicMute
         {
             using (SettingsForm settingsForm = new SettingsForm(config))
             {
-                if (settingsForm.ShowDialog() == DialogResult.OK)
+                DialogResult result;
+                ReleaseHeldPushToTalkKeys();
+                settingsOpen = true;
+                try
+                {
+                    result = settingsForm.ShowDialog();
+                }
+                finally
+                {
+                    settingsOpen = false;
+                }
+
+                if (result == DialogResult.OK)
                 {
                     UnregisterAllHotkeys();
                     
@@ -931,7 +1130,8 @@ namespace MicMute
             }
         }
 
-        private static bool? GetSystemMicrophoneMuteState()
+        /// <summary>Nur das Standardgerät - einzig für den WM_APPCOMMAND-Fallback.</summary>
+        private static bool? GetDefaultMicrophoneMuteState()
         {
             IntPtr endpointVolume;
             IAudioEndpointVolumeVtbl volumeVtbl;
@@ -949,7 +1149,7 @@ namespace MicMute
             }
             catch (Exception ex)
             {
-                Log("GetSystemMicrophoneMuteState", ex);
+                Log("GetDefaultMicrophoneMuteState", ex);
                 return null;
             }
             finally
@@ -958,33 +1158,446 @@ namespace MicMute
             }
         }
 
-        /// <summary>
-        /// Setzt den Mute-Status direkt. Anders als WM_APPCOMMAND ist das kein Toggle,
-        /// sondern idempotent.
-        /// </summary>
-        private static bool SetSystemMicrophoneMuteState(bool muted)
+        /// <summary>Ergebnis einer Stumm-/Einschaltaktion über alle Aufnahmegeräte.</summary>
+        private enum MuteApplyResult { Ok, Partial, Unavailable }
+
+        private struct CaptureEndpoint
         {
-            IntPtr endpointVolume;
-            IAudioEndpointVolumeVtbl volumeVtbl;
+            public string Id;
+            public IntPtr Volume;
+        }
 
-            if (!TryGetEndpointVolume(out endpointVolume, out volumeVtbl))
-                return false;
+        /// <summary>IDs der Geräte, die vor dem Stummschalten offen waren. Nur im Speicher.</summary>
+        private static readonly HashSet<string> reactivateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>true, solange isMuted gilt, aber nicht alle Geräte bestätigt stumm sind.</summary>
+        private static bool muteIncomplete = false;
+
+        private static string lastGuardMessage;
+
+        private static string GetDeviceId(IntPtr device)
+        {
+            IntPtr idPtr = IntPtr.Zero;
+            try
+            {
+                var deviceVtbl = (IMMDeviceVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(device), typeof(IMMDeviceVtbl));
+                if (deviceVtbl.GetId(device, out idPtr) != 0 || idPtr == IntPtr.Zero)
+                    return null;
+                return Marshal.PtrToStringUni(idPtr);
+            }
+            catch (Exception ex)
+            {
+                Log("GetDeviceId", ex);
+                return null;
+            }
+            finally
+            {
+                // GetId liefert CoTaskMem-Speicher
+                if (idPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(idPtr);
+            }
+        }
+
+        /// <summary>
+        /// Alle aktiven Aufnahmegeräte mit ID und IAudioEndpointVolume, nicht nur das
+        /// Standardgerät: Teams & Co. nehmen oft das Kommunikationsgerät oder ein eigenes.
+        /// Der Aufrufer muss ReleaseEndpoints() aufrufen. Leere Liste = nicht verfügbar.
+        /// </summary>
+        private static List<CaptureEndpoint> GetActiveCaptureEndpoints()
+        {
+            var result = new List<CaptureEndpoint>();
+            IntPtr deviceEnumerator = IntPtr.Zero;
+            IntPtr collection = IntPtr.Zero;
+
+            try
+            {
+                Guid clsid = CLSID_MMDeviceEnumerator;
+                Guid iid = IID_IMMDeviceEnumerator;
+
+                int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC_SERVER, ref iid, out deviceEnumerator);
+                if (hr != 0 || deviceEnumerator == IntPtr.Zero)
+                    return result;
+
+                var vtbl = (IMMDeviceEnumeratorVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(deviceEnumerator), typeof(IMMDeviceEnumeratorVtbl));
+
+                hr = vtbl.EnumAudioEndpoints(deviceEnumerator, eCapture, DEVICE_STATE_ACTIVE, out collection);
+                if (hr != 0 || collection == IntPtr.Zero)
+                    return result;
+
+                var collectionVtbl = (IMMDeviceCollectionVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(collection), typeof(IMMDeviceCollectionVtbl));
+
+                uint count;
+                if (collectionVtbl.GetCount(collection, out count) != 0)
+                    return result;
+
+                for (uint i = 0; i < count; i++)
+                {
+                    IntPtr device = IntPtr.Zero;
+                    try
+                    {
+                        if (collectionVtbl.Item(collection, i, out device) != 0 || device == IntPtr.Zero)
+                            continue;
+
+                        var deviceVtbl = (IMMDeviceVtbl)Marshal.PtrToStructure(
+                            Marshal.ReadIntPtr(device), typeof(IMMDeviceVtbl));
+
+                        Guid volumeIid = IID_IAudioEndpointVolume;
+                        IntPtr endpointVolume;
+                        if (deviceVtbl.Activate(device, ref volumeIid, CLSCTX_ALL, IntPtr.Zero, out endpointVolume) == 0
+                            && endpointVolume != IntPtr.Zero)
+                        {
+                            CaptureEndpoint ep;
+                            ep.Id = GetDeviceId(device);
+                            ep.Volume = endpointVolume;
+                            result.Add(ep);
+                        }
+                    }
+                    finally
+                    {
+                        SafeRelease(device);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("GetActiveCaptureEndpoints", ex);
+            }
+            finally
+            {
+                SafeRelease(collection);
+                SafeRelease(deviceEnumerator);
+            }
+
+            return result;
+        }
+
+        private static void ReleaseEndpoints(List<CaptureEndpoint> endpoints)
+        {
+            foreach (CaptureEndpoint ep in endpoints)
+                SafeRelease(ep.Volume);
+        }
+
+        /// <summary>IDs der Standard-Aufnahmegeräte für Konsole und Kommunikation.</summary>
+        private static HashSet<string> GetDefaultCaptureIds()
+        {
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            IntPtr deviceEnumerator = IntPtr.Zero;
+
+            try
+            {
+                Guid clsid = CLSID_MMDeviceEnumerator;
+                Guid iid = IID_IMMDeviceEnumerator;
+
+                int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC_SERVER, ref iid, out deviceEnumerator);
+                if (hr != 0 || deviceEnumerator == IntPtr.Zero)
+                    return ids;
+
+                var vtbl = (IMMDeviceEnumeratorVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(deviceEnumerator), typeof(IMMDeviceEnumeratorVtbl));
+
+                foreach (int role in new[] { eConsole, eCommunications })
+                {
+                    IntPtr device = IntPtr.Zero;
+                    try
+                    {
+                        if (vtbl.GetDefaultAudioEndpoint(deviceEnumerator, eCapture, role, out device) == 0 && device != IntPtr.Zero)
+                        {
+                            string id = GetDeviceId(device);
+                            if (id != null) ids.Add(id);
+                        }
+                    }
+                    finally
+                    {
+                        SafeRelease(device);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("GetDefaultCaptureIds", ex);
+            }
+            finally
+            {
+                SafeRelease(deviceEnumerator);
+            }
+
+            return ids;
+        }
+
+        private static IAudioEndpointVolumeVtbl GetVolumeVtbl(IntPtr endpointVolume)
+        {
+            return (IAudioEndpointVolumeVtbl)Marshal.PtrToStructure(
+                Marshal.ReadIntPtr(endpointVolume), typeof(IAudioEndpointVolumeVtbl));
+        }
+
+        /// <summary>1 = stumm, 0 = offen, -1 = nicht lesbar.</summary>
+        private static int ReadMute(IntPtr endpointVolume)
+        {
+            try
+            {
+                int muted;
+                if (GetVolumeVtbl(endpointVolume).GetMute(endpointVolume, out muted) < 0)
+                    return -1;
+                return muted != 0 ? 1 : 0;
+            }
+            catch (Exception ex)
+            {
+                Log("ReadMute", ex);
+                return -1;
+            }
+        }
+
+        private static void WriteMute(IntPtr endpointVolume, bool muted)
+        {
             try
             {
                 Guid eventContext = Guid.Empty;
                 // S_FALSE (1) bedeutet "war bereits in diesem Zustand" und ist ein Erfolg.
-                return volumeVtbl.SetMute(endpointVolume, muted ? 1 : 0, ref eventContext) >= 0;
+                GetVolumeVtbl(endpointVolume).SetMute(endpointVolume, muted ? 1 : 0, ref eventContext);
             }
             catch (Exception ex)
             {
-                Log("SetSystemMicrophoneMuteState", ex);
-                return false;
+                Log("WriteMute", ex);
+            }
+        }
+
+        /// <summary>Liest nach dem Schreiben bis ~200 ms nach: Bluetooth-Geräte melden den neuen Zustand verzögert.</summary>
+        private static bool ConfirmMute(IntPtr endpointVolume, bool expectedMuted)
+        {
+            int expected = expectedMuted ? 1 : 0;
+            Stopwatch watch = Stopwatch.StartNew();
+
+            while (true)
+            {
+                if (ReadMute(endpointVolume) == expected)
+                    return true;
+                if (watch.ElapsedMilliseconds >= 200)
+                    return false;
+                Thread.Sleep(15);
+            }
+        }
+
+        private static string JoinIds(IEnumerable<string> ids)
+        {
+            string joined = string.Join(", ", ids.ToArray());
+            return joined.Length == 0 ? "-" : joined;
+        }
+
+        /// <summary>
+        /// Stumm nur, wenn ALLE aktiven Aufnahmegeräte stumm sind. Ein nicht lesbares
+        /// Gerät gilt als nicht stumm. null ohne Geräteliste.
+        /// </summary>
+        private static bool? GetSystemMicrophoneMuteState()
+        {
+            List<CaptureEndpoint> endpoints = GetActiveCaptureEndpoints();
+            try
+            {
+                if (endpoints.Count == 0)
+                    return null;
+
+                foreach (CaptureEndpoint ep in endpoints)
+                {
+                    if (ReadMute(ep.Volume) != 1)
+                        return false;
+                }
+                return true;
             }
             finally
             {
-                SafeRelease(endpointVolume);
+                ReleaseEndpoints(endpoints);
             }
+        }
+
+        /// <summary>
+        /// Schaltet alle aktiven Aufnahmegeräte stumm. Geräte, die vorher offen waren, kommen
+        /// in reactivateIds - nur sie werden beim Einschalten wieder geöffnet. Danach wird
+        /// nachgelesen: Ok nur, wenn wirklich alle stumm sind.
+        /// explicitAction = false: Aufruf aus der Kontrolle, loggt nur bei Handlung und ohne Wiederholung.
+        /// </summary>
+        private static MuteApplyResult MuteAllMicrophones(bool explicitAction)
+        {
+            string label = explicitAction ? "Stummschalten" : "Kontrolle";
+            List<CaptureEndpoint> endpoints = GetActiveCaptureEndpoints();
+
+            try
+            {
+                if (endpoints.Count == 0)
+                {
+                    if (explicitAction) Log(label + ": keine aktiven Aufnahmegeräte gefunden");
+                    return MuteApplyResult.Unavailable;
+                }
+
+                var acted = new List<CaptureEndpoint>();
+                foreach (CaptureEndpoint ep in endpoints)
+                {
+                    int state = ReadMute(ep.Volume);
+                    if (state == 1)
+                        continue;
+                    if (state == 0 && ep.Id != null)
+                        reactivateIds.Add(ep.Id);
+                    WriteMute(ep.Volume, true);
+                    acted.Add(ep);
+                }
+
+                if (acted.Count == 0)
+                {
+                    if (explicitAction)
+                        Log(string.Format("{0}: alle {1} Mikrofone bereits stumm", label, endpoints.Count));
+                    lastGuardMessage = null;
+                    return MuteApplyResult.Ok;
+                }
+
+                var failed = new List<string>();
+                foreach (CaptureEndpoint ep in acted)
+                {
+                    if (!ConfirmMute(ep.Volume, true))
+                        failed.Add(ep.Id ?? "?");
+                }
+
+                string message = string.Format("{0}: {1} Mikrofone aktiv, {2} stummgeschaltet, fehlgeschlagen: {3} - IDs: {4}",
+                    label, endpoints.Count, acted.Count - failed.Count, JoinIds(failed),
+                    JoinIds(acted.Select(ep => ep.Id ?? "?")));
+
+                // Die Kontrolle alle 2 s soll das Protokoll bei Dauerfehlern nicht fluten.
+                if (explicitAction || message != lastGuardMessage)
+                    Log(message);
+                lastGuardMessage = explicitAction ? null : message;
+
+                return failed.Count == 0 ? MuteApplyResult.Ok : MuteApplyResult.Partial;
+            }
+            finally
+            {
+                ReleaseEndpoints(endpoints);
+            }
+        }
+
+        /// <summary>
+        /// Öffnet nur die Geräte, die vor dem Stummschalten offen waren. Ohne Gedächtnis
+        /// (Start mit bereits stummen Geräten, oder die gemerkten Geräte sind weg) werden die
+        /// Standardgeräte für Konsole und Kommunikation geöffnet - die nutzen Teams & Co.;
+        /// "alle" würde ein absichtlich stummes Mikrofon öffnen.
+        /// </summary>
+        private static MuteApplyResult UnmuteRememberedMicrophones()
+        {
+            List<CaptureEndpoint> endpoints = GetActiveCaptureEndpoints();
+
+            try
+            {
+                if (endpoints.Count == 0)
+                {
+                    Log("Einschalten: keine aktiven Aufnahmegeräte gefunden");
+                    return MuteApplyResult.Unavailable;
+                }
+
+                string rule = "vorher offene";
+                var targets = new HashSet<string>(
+                    endpoints.Where(ep => ep.Id != null && reactivateIds.Contains(ep.Id)).Select(ep => ep.Id),
+                    StringComparer.OrdinalIgnoreCase);
+
+                if (targets.Count == 0)
+                {
+                    targets = GetDefaultCaptureIds();
+                    rule = "Standardgeräte";
+                }
+
+                var opened = new List<string>();
+                var failed = new List<string>();
+                foreach (CaptureEndpoint ep in endpoints)
+                {
+                    if (ep.Id == null || !targets.Contains(ep.Id))
+                        continue;
+                    WriteMute(ep.Volume, false);
+                    if (ConfirmMute(ep.Volume, false)) opened.Add(ep.Id); else failed.Add(ep.Id);
+                }
+
+                reactivateIds.Clear();
+
+                Log(string.Format("Einschalten ({0}): {1} Mikrofone aktiv, {2} geöffnet, fehlgeschlagen: {3} - IDs: {4}",
+                    rule, endpoints.Count, opened.Count, JoinIds(failed), JoinIds(opened)));
+
+                return failed.Count == 0 && opened.Count > 0 ? MuteApplyResult.Ok : MuteApplyResult.Partial;
+            }
+            finally
+            {
+                ReleaseEndpoints(endpoints);
+            }
+        }
+
+        /// <summary>Merkt sich unvollständiges Stummschalten; Hinweis immer, auch bei abgeschalteten Toasts.</summary>
+        private static void SetMuteIncomplete(bool incomplete)
+        {
+            if (incomplete && !muteIncomplete)
+            {
+                Log("WARNUNG: nicht alle Mikrofone stumm - Icon zeigt nicht \"stumm\"");
+                ShowNotification(Translations.MuteIncomplete(config.AppLanguage));
+            }
+            else if (!incomplete && muteIncomplete && isMuted)
+            {
+                Log("Alle Mikrofone jetzt stumm");
+            }
+
+            muteIncomplete = incomplete;
+        }
+
+        // ponytail: Hier bewusst Polling statt Ereignis (anders als der WinEvent-Hook oben):
+        // ponytail: IMMNotificationClient bräuchte COM-Rückrufe auf fremden Threads. Der Tick
+        // ponytail: läuft nur im stummen Zustand, auf dem UI-Thread, und erkennt neue Geräte
+        // ponytail: genauso wie von außen wieder geöffnete.
+        private static System.Windows.Forms.Timer muteGuardTimer;
+
+        private static void UpdateMuteGuardTimer()
+        {
+            if (muteGuardTimer != null)
+                muteGuardTimer.Enabled = isMuted;
+        }
+
+        private static void MuteGuardTick(object sender, EventArgs e)
+        {
+            try
+            {
+                if (!isMuted)
+                {
+                    UpdateMuteGuardTimer();
+                    return;
+                }
+
+                MuteApplyResult result = MuteAllMicrophones(false);
+                if (result == MuteApplyResult.Unavailable)
+                    return;
+
+                bool wasIncomplete = muteIncomplete;
+                SetMuteIncomplete(result != MuteApplyResult.Ok);
+                if (wasIncomplete != muteIncomplete)
+                {
+                    UpdateTrayIcon();
+                    SyncLed(isMuted && !muteIncomplete);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("MuteGuardTick", ex);
+            }
+        }
+
+        /// <summary>Idempotent: aus dem Beenden-Menü und aus dem finally von Main.</summary>
+        private static void StopMuteGuard()
+        {
+            if (muteGuardTimer == null)
+                return;
+
+            try
+            {
+                muteGuardTimer.Stop();
+                muteGuardTimer.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log("StopMuteGuard", ex);
+            }
+
+            muteGuardTimer = null;
         }
 
         private static void LoadMicStateFromFile()
@@ -1033,11 +1646,30 @@ namespace MicMute
             // EnumAudioEndpoints ist Slot 3 des Interfaces. Fehlte bis v2.2.0, dadurch
             // landete jeder GetDefaultAudioEndpoint-Aufruf auf EnumAudioEndpoints und
             // scheiterte mit E_INVALIDARG (0x80070057) - der Mute-Status wurde nie gelesen.
-            public IntPtr EnumAudioEndpoints;
+            public EnumAudioEndpointsDelegate EnumAudioEndpoints;
             public GetDefaultAudioEndpointDelegate GetDefaultAudioEndpoint;
 
             [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int EnumAudioEndpointsDelegate(IntPtr This, int dataFlow, int dwStateMask, out IntPtr ppDevices);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
             public delegate int GetDefaultAudioEndpointDelegate(IntPtr This, int dataFlow, int role, out IntPtr ppDevice);
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IMMDeviceCollectionVtbl
+        {
+            public IntPtr QueryInterface;
+            public IntPtr AddRef;
+            public IntPtr Release;
+            public GetCountDelegate GetCount;
+            public ItemDelegate Item;
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int GetCountDelegate(IntPtr This, out uint pcDevices);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int ItemDelegate(IntPtr This, uint nDevice, out IntPtr ppDevice);
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1048,11 +1680,14 @@ namespace MicMute
             public IntPtr Release;
             public ActivateDelegate Activate;
             public IntPtr OpenPropertyStore;
-            public IntPtr GetId;
+            public GetIdDelegate GetId;
             public IntPtr GetState;
 
             [UnmanagedFunctionPointer(CallingConvention.StdCall)]
             public delegate int ActivateDelegate(IntPtr This, ref Guid iid, int dwClsCtx, IntPtr pActivationParams, out IntPtr ppInterface);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int GetIdDelegate(IntPtr This, out IntPtr ppstrId);
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1087,7 +1722,8 @@ namespace MicMute
 
         private static void ToggleMic(object sender, EventArgs e)
         {
-            SetMicMuted(!isMuted, MuteSource.Toggle);
+            // Umschalten nach dem angezeigten Zustand: bei unvollständigem Stumm erneut stummschalten.
+            SetMicMuted(!(isMuted && !muteIncomplete), MuteSource.Toggle);
         }
 
         private static void SetMicMutedExplicit(object sender, EventArgs e)
@@ -1109,23 +1745,31 @@ namespace MicMute
         {
             isMuted = muted;
 
-            if (!SetSystemMicrophoneMuteState(muted))
+            MuteApplyResult result = muted ? MuteAllMicrophones(true) : UnmuteRememberedMicrophones();
+
+            if (result == MuteApplyResult.Unavailable)
             {
-                // Fallback für Systeme ohne nutzbares IAudioEndpointVolume.
-                // WM_APPCOMMAND ist ein Toggle, wird also nur bei echtem Unterschied gesendet.
-                bool? actualSystemState = GetSystemMicrophoneMuteState();
-                if (!actualSystemState.HasValue || actualSystemState.Value != muted)
+                // Fallback nur ohne nutzbare Geräteliste. WM_APPCOMMAND ist ein Toggle und trifft
+                // nur das Standardgerät: senden nur, wenn dessen Zustand bekannt und anders ist.
+                bool? defaultState = GetDefaultMicrophoneMuteState();
+                IntPtr hwnd = GetForegroundWindow();
+                if (defaultState.HasValue && defaultState.Value != muted && hwnd != IntPtr.Zero)
                 {
-                    IntPtr hwnd = GetForegroundWindow();
-                    if (hwnd != IntPtr.Zero)
-                    {
-                        SendMessageW(hwnd, WM_APPCOMMAND, hwnd, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
-                    }
+                    SendMessageW(hwnd, WM_APPCOMMAND, hwnd, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
+                    Log("Geräteliste nicht verfügbar - WM_APPCOMMAND an das Standardgerät gesendet");
+                }
+                else
+                {
+                    Log("Geräteliste nicht verfügbar - kein Fallback (Zustand des Standardgeräts unbekannt oder schon richtig)");
                 }
             }
 
+            // Rot nur bei bestätigtem Stumm aller Mikrofone.
+            SetMuteIncomplete(muted && result != MuteApplyResult.Ok);
+
             UpdateTrayIcon();
-            SyncLed(muted);
+            SyncLed(isMuted && !muteIncomplete);
+            UpdateMuteGuardTimer();
 
             // Push-to-Talk feuert pro Tastendruck - dabei nicht bei jedem Anschlag
             // die komplette Konfigurationsdatei neu schreiben.
@@ -1177,13 +1821,16 @@ namespace MicMute
         {
             try
             {
-                trayIcon.Icon = isMuted ? iconMuted : iconUnmuted;
-                trayIcon.Text = Translations.TrayStatus(config.AppLanguage, isMuted);
+                // Rot nur, wenn das Nachlesen bestätigt hat, dass wirklich alle stumm sind.
+                bool shownMuted = isMuted && !muteIncomplete;
+                trayIcon.Icon = shownMuted ? iconMuted : iconUnmuted;
+                trayIcon.Text = Translations.TrayStatus(config.AppLanguage, shownMuted);
 
                 if (statusItem != null)
-                    statusItem.Text = Translations.TrayStatus(config.AppLanguage, isMuted);
+                    statusItem.Text = Translations.TrayStatus(config.AppLanguage, shownMuted);
 
-                muteItem.Visible = !isMuted;
+                // Bei unvollständigem Stummschalten beides anbieten: erneut versuchen oder aufgeben.
+                muteItem.Visible = !shownMuted;
                 unmuteItem.Visible = isMuted;
             }
             catch (Exception ex)
@@ -1221,7 +1868,7 @@ namespace MicMute
                 pttItem.Text = Translations.PushToTalk(lang);
                 pttItem.Checked = config.PushToTalkEnabled;
                 // Ohne belegte Taste ist der Schalter wirkungslos
-                pttItem.Visible = config.PushToTalkKey != Keys.None;
+                pttItem.Visible = config.HasPushToTalkKey;
 
                 toastItem.Text = Translations.ToastNotifications(lang);
                 toastItem.Checked = AnyToastEnabled();
@@ -1271,19 +1918,15 @@ namespace MicMute
                     {
                         ToggleMic(null, EventArgs.Empty);
                     }
+                    // SetMute ist idempotent: kein Vergleich mit isMuted, damit "Stumm"
+                    // bei unvollständigem Stummschalten erneut versucht wird.
                     else if (m.WParam.ToInt32() == HOTKEY_ID_MUTE)
                     {
-                        if (!isMuted)
-                        {
-                            SetMicMutedExplicit(null, EventArgs.Empty);
-                        }
+                        SetMicMutedExplicit(null, EventArgs.Empty);
                     }
                     else if (m.WParam.ToInt32() == HOTKEY_ID_UNMUTE)
                     {
-                        if (isMuted)
-                        {
-                            SetMicUnmutedExplicit(null, EventArgs.Empty);
-                        }
+                        SetMicUnmutedExplicit(null, EventArgs.Empty);
                     }
                 }
                 base.WndProc(ref m);
@@ -1379,6 +2022,13 @@ namespace MicMute
             return lang == Language.German ? "Hier klicken und Tastenkombination drücken..." : "Click here and press a key combination...";
         }
 
+        public static string MuteIncomplete(Language lang)
+        {
+            return lang == Language.German
+                ? "Nicht alle Mikrofone konnten stummgeschaltet werden - siehe Protokoll."
+                : "Not all microphones could be muted - see log.";
+        }
+
         public static string TrayIconClickBehavior(Language lang)
         {
             return lang == Language.German ? "Tray-Icon Klick-Verhalten" : "Tray Icon Click Behavior";
@@ -1451,7 +2101,19 @@ namespace MicMute
 
         public static string PushToTalkDescription(Language lang)
         {
-            return lang == Language.German ? "Taste gedrückt halten = Mikrofon an, Loslassen = Mikrofon aus" : "Hold key = microphone on, release = microphone off";
+            return lang == Language.German
+                ? "Taste gedrückt halten = Mikrofon an, Loslassen = Mikrofon aus. Solange Push-to-Talk aktiv ist, hat die Taste keine andere Funktion."
+                : "Hold a key = microphone on, release = microphone off. While push-to-talk is active, the key does nothing else.";
+        }
+
+        public static string AddPushToTalkKey(Language lang)
+        {
+            return lang == Language.German ? "Weitere Taste hinzufügen" : "Add another key";
+        }
+
+        public static string RemovePushToTalkKey(Language lang)
+        {
+            return lang == Language.German ? "Taste entfernen" : "Remove key";
         }
 
         public static string ToastNotifications(Language lang)
@@ -1613,6 +2275,19 @@ namespace MicMute
         }
     }
 
+    /// <summary>Eine Taste mit ihren Modifiern (Strg, Umschalt, Alt).</summary>
+    public struct HotkeyBinding
+    {
+        public readonly Keys Key;
+        public readonly Keys Modifiers;
+
+        public HotkeyBinding(Keys key, Keys modifiers)
+        {
+            Key = key;
+            Modifiers = modifiers;
+        }
+    }
+
     public class Config
     {
         public bool HotkeyToggleEnabled { get; set; }
@@ -1628,8 +2303,13 @@ namespace MicMute
         public Keys HotkeyUnmuteModifiers { get; set; }
         
         public bool PushToTalkEnabled { get; set; }
-        public Keys PushToTalkKey { get; set; }
-        public Keys PushToTalkModifiers { get; set; }
+        /// <summary>
+        /// Push-to-Talk-Tasten. Die erste steht wie bisher in PUSH_TO_TALK_KEY/_MODIFIERS,
+        /// alle weiteren in PUSH_TO_TALK_EXTRA_KEYS. Enthält nie Keys.None.
+        /// </summary>
+        public List<HotkeyBinding> PushToTalkKeys { get; set; }
+
+        public bool HasPushToTalkKey { get { return PushToTalkKeys != null && PushToTalkKeys.Count > 0; } }
         
         public bool ShowToastOnToggle { get; set; }
         public bool ShowToastOnMute { get; set; }
@@ -1672,8 +2352,7 @@ namespace MicMute
             HotkeyUnmuteModifiers = Keys.None;
             
             PushToTalkEnabled = false;
-            PushToTalkKey = Keys.None;
-            PushToTalkModifiers = Keys.None;
+            PushToTalkKeys = new List<HotkeyBinding>();
             
             ShowToastOnToggle = false;
             ShowToastOnMute = false;
@@ -1702,7 +2381,49 @@ namespace MicMute
         {
             Config copy = (Config)this.MemberwiseClone();
             copy.unknownLines = new List<string>(this.unknownLines);
+            copy.PushToTalkKeys = new List<HotkeyBinding>(this.PushToTalkKeys);
             return copy;
+        }
+
+        /// <summary>
+        /// PUSH_TO_TALK_EXTRA_KEYS: "Taste|Modifier;Taste|Modifier", z. B. "F14|None;LaunchApplication1|Control".
+        /// Kommas gehören zu Keys.ToString() ("Shift, Control"), deshalb | und ; als Trenner.
+        /// Ungültige und doppelte Einträge werden übersprungen.
+        /// </summary>
+        private static List<HotkeyBinding> ParsePushToTalkKeys(Keys firstKey, Keys firstModifiers, string extra)
+        {
+            var result = new List<HotkeyBinding>();
+            AddPushToTalkKey(result, firstKey, firstModifiers);
+
+            foreach (string entry in (extra ?? "").Split(';'))
+            {
+                string[] parts = entry.Split('|');
+                Keys key;
+                Keys modifiers = Keys.None;
+                if (!Enum.TryParse(parts[0].Trim(), out key))
+                    continue;
+                if (parts.Length > 1 && !Enum.TryParse(parts[1].Trim(), out modifiers))
+                    continue;
+                AddPushToTalkKey(result, key, modifiers);
+            }
+
+            return result;
+        }
+
+        private static void AddPushToTalkKey(List<HotkeyBinding> list, Keys key, Keys modifiers)
+        {
+            // Taste und Modifier sauber trennen, falls die Datei von Hand bearbeitet wurde
+            key &= Keys.KeyCode;
+            modifiers &= Keys.Modifiers;
+            if (key == Keys.None)
+                return;
+
+            foreach (HotkeyBinding b in list)
+            {
+                if (b.Key == key && b.Modifiers == modifiers)
+                    return;
+            }
+            list.Add(new HotkeyBinding(key, modifiers));
         }
 
         public static Config Load()
@@ -1714,6 +2435,10 @@ namespace MicMute
                 config.SaveWithMutedState(true);
                 return config;
             }
+
+            Keys pttKey = Keys.None;
+            Keys pttModifiers = Keys.None;
+            string pttExtra = "";
 
             try
             {
@@ -1769,11 +2494,14 @@ namespace MicMute
                         case "PUSH_TO_TALK_ENABLED": 
                             if(bool.TryParse(val, out bVal)) config.PushToTalkEnabled = bVal; 
                             break;
-                        case "PUSH_TO_TALK_KEY": 
-                            if(Enum.TryParse(val, out kVal)) config.PushToTalkKey = kVal; 
+                        case "PUSH_TO_TALK_KEY":
+                            if(Enum.TryParse(val, out kVal)) pttKey = kVal;
                             break;
-                        case "PUSH_TO_TALK_MODIFIERS": 
-                            if(Enum.TryParse(val, out kVal)) config.PushToTalkModifiers = kVal; 
+                        case "PUSH_TO_TALK_MODIFIERS":
+                            if(Enum.TryParse(val, out kVal)) pttModifiers = kVal;
+                            break;
+                        case "PUSH_TO_TALK_EXTRA_KEYS":
+                            pttExtra = val;
                             break;
                         
                         case "SHOW_TOAST_ON_TOGGLE": 
@@ -1841,6 +2569,8 @@ namespace MicMute
                 Program.Log("Config.Load", ex);
             }
 
+            config.PushToTalkKeys = ParsePushToTalkKeys(pttKey, pttModifiers, pttExtra);
+
             // Sync Autostart status with Registry logic
             bool actualAutostartStatus = GetAutostartStatus();
             if (config.AutostartEnabled != actualAutostartStatus)
@@ -1891,8 +2621,12 @@ namespace MicMute
                 sb.AppendLine("HOTKEY_UNMUTE_MODIFIERS=" + HotkeyUnmuteModifiers);
                 
                 sb.AppendLine("PUSH_TO_TALK_ENABLED=" + PushToTalkEnabled);
-                sb.AppendLine("PUSH_TO_TALK_KEY=" + PushToTalkKey);
-                sb.AppendLine("PUSH_TO_TALK_MODIFIERS=" + PushToTalkModifiers);
+                // Erste Taste in den alten Schlüsseln, damit ältere Versionen sie weiter lesen
+                HotkeyBinding firstPtt = PushToTalkKeys.Count > 0 ? PushToTalkKeys[0] : new HotkeyBinding(Keys.None, Keys.None);
+                sb.AppendLine("PUSH_TO_TALK_KEY=" + firstPtt.Key);
+                sb.AppendLine("PUSH_TO_TALK_MODIFIERS=" + firstPtt.Modifiers);
+                sb.AppendLine("PUSH_TO_TALK_EXTRA_KEYS=" + string.Join(";",
+                    PushToTalkKeys.Skip(1).Select(b => b.Key + "|" + b.Modifiers).ToArray()));
                 
                 sb.AppendLine("SHOW_TOAST_ON_TOGGLE=" + ShowToastOnToggle);
                 sb.AppendLine("SHOW_TOAST_ON_MUTE=" + ShowToastOnMute);
@@ -2011,8 +2745,11 @@ namespace MicMute
         private Config config;
         
         private CheckBox chkEnablePushToTalk;
-        private TextBox txtPushToTalkHotkey;
-        private Label lblPushToTalkHotkey;
+        private FlowLayoutPanel pnlPushToTalkKeys;
+        private Button btnAddPushToTalkKey;
+        private ToolTip toolTipPushToTalk;
+        private readonly List<TextBox> pushToTalkBoxes = new List<TextBox>();
+        private readonly List<Button> pushToTalkRemoveButtons = new List<Button>();
 		private Label lblPushToTalkDesc;
         private CheckBox chkShowToastOnToggle;
         private CheckBox chkShowToastOnMute;
@@ -2052,9 +2789,8 @@ namespace MicMute
         private Keys muteModifiers = Keys.None;
         private Keys unmuteKey = Keys.None;
         private Keys unmuteModifiers = Keys.None;
-        private Keys pushToTalkKey = Keys.None;
-        private Keys pushToTalkModifiers = Keys.None;
-        
+        private List<HotkeyBinding> pushToTalkBindings = new List<HotkeyBinding>();
+
         private TextBox activeTextBox = null;
 
         public SettingsForm(Config cfg)
@@ -2067,8 +2803,7 @@ namespace MicMute
             muteModifiers = config.HotkeyMuteModifiers;
             unmuteKey = config.HotkeyUnmuteKey;
             unmuteModifiers = config.HotkeyUnmuteModifiers;
-            pushToTalkKey = config.PushToTalkKey;
-            pushToTalkModifiers = config.PushToTalkModifiers;
+            pushToTalkBindings = new List<HotkeyBinding>(config.PushToTalkKeys);
 
             InitializeComponents();
         }
@@ -2380,7 +3115,7 @@ namespace MicMute
             {
                 Text = Translations.PushToTalk(config.AppLanguage),
                 Location = new Point(10, 10),
-                Size = new Size(405, 130)
+                Size = new Size(405, 195)
             };
 
             chkEnablePushToTalk = new CheckBox
@@ -2390,48 +3125,59 @@ namespace MicMute
                 Size = new Size(150, 20),
                 Checked = config.PushToTalkEnabled
             };
-            chkEnablePushToTalk.CheckedChanged += delegate(object s, EventArgs e) 
+            chkEnablePushToTalk.CheckedChanged += delegate(object s, EventArgs e)
             {
-                txtPushToTalkHotkey.Enabled = chkEnablePushToTalk.Checked;
-                UpdateHotkeyDisplay(txtPushToTalkHotkey, chkEnablePushToTalk.Checked, pushToTalkKey, pushToTalkModifiers);
+                UpdatePushToTalkEnabled();
             };
 
-            lblPushToTalkHotkey = new Label
+            // Feste Höhe mit Scrollleiste: viele Tasten verschieben das Layout darunter nicht
+            pnlPushToTalkKeys = new FlowLayoutPanel
             {
-                Text = Translations.Hotkey(config.AppLanguage),
-                Location = new Point(15, 55),
-                Size = new Size(60, 20)
+                Location = new Point(15, 50),
+                Size = new Size(380, 87),
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                AutoScroll = true
             };
 
-            txtPushToTalkHotkey = new TextBox
+            toolTipPushToTalk = new ToolTip();
+            this.FormClosed += delegate(object s, FormClosedEventArgs e) { toolTipPushToTalk.Dispose(); };
+
+            btnAddPushToTalkKey = new Button
             {
-                Location = new Point(80, 52),
-                Size = new Size(300, 23),
-                ReadOnly = true,
-                Enabled = config.PushToTalkEnabled,
-                Tag = "pushtotalk"
+                Text = "+",
+                Location = new Point(15, 142),
+                Size = new Size(28, 25)
             };
-            txtPushToTalkHotkey.Enter += delegate(object s, EventArgs e) { activeTextBox = txtPushToTalkHotkey; };
-            txtPushToTalkHotkey.KeyDown += TxtHotkey_KeyDown;
-            txtPushToTalkHotkey.PreviewKeyDown += TxtHotkey_PreviewKeyDown;
+            toolTipPushToTalk.SetToolTip(btnAddPushToTalkKey, Translations.AddPushToTalkKey(config.AppLanguage));
+            btnAddPushToTalkKey.Click += delegate(object s, EventArgs e)
+            {
+                pushToTalkBindings.Add(new HotkeyBinding(Keys.None, Keys.None));
+                RebuildPushToTalkRows();
+                TextBox last = pushToTalkBoxes[pushToTalkBoxes.Count - 1];
+                pnlPushToTalkKeys.ScrollControlIntoView(last.Parent);
+                last.Focus();
+            };
 
             lblPushToTalkDesc = new Label
             {
                 Text = Translations.PushToTalkDescription(config.AppLanguage),
-                Location = new Point(15, 85),
-                Size = new Size(375, 35),
+                Location = new Point(50, 145),
+                Size = new Size(345, 45),
                 ForeColor = Color.Gray
             };
 
             grpPushToTalk.Controls.Add(chkEnablePushToTalk);
-            grpPushToTalk.Controls.Add(lblPushToTalkHotkey);
-            grpPushToTalk.Controls.Add(txtPushToTalkHotkey);
+            grpPushToTalk.Controls.Add(pnlPushToTalkKeys);
+            grpPushToTalk.Controls.Add(btnAddPushToTalkKey);
             grpPushToTalk.Controls.Add(lblPushToTalkDesc);
+
+            RebuildPushToTalkRows();
 
             grpNotifications = new GroupBox
             {
                 Text = Translations.ToastNotifications(config.AppLanguage),
-                Location = new Point(10, 150),
+                Location = new Point(10, 215),
                 Size = new Size(405, 165)
             };
 
@@ -2515,7 +3261,7 @@ namespace MicMute
             UpdateHotkeyDisplay(txtToggleHotkey, chkEnableToggle.Checked, toggleKey, toggleModifiers);
             UpdateHotkeyDisplay(txtMuteHotkey, chkEnableMute.Checked, muteKey, muteModifiers);
             UpdateHotkeyDisplay(txtUnmuteHotkey, chkEnableUnmute.Checked, unmuteKey, unmuteModifiers);
-            UpdateHotkeyDisplay(txtPushToTalkHotkey, chkEnablePushToTalk.Checked, pushToTalkKey, pushToTalkModifiers);
+            UpdatePushToTalkDisplays();
         }
 
         /// <summary>Eine Profilregel. ToString() liefert die Anzeige, Raw das Speicherformat.</summary>
@@ -2838,12 +3584,14 @@ namespace MicMute
             UpdateHotkeyDisplay(txtToggleHotkey, chkEnableToggle.Checked, toggleKey, toggleModifiers);
             UpdateHotkeyDisplay(txtMuteHotkey, chkEnableMute.Checked, muteKey, muteModifiers);
             UpdateHotkeyDisplay(txtUnmuteHotkey, chkEnableUnmute.Checked, unmuteKey, unmuteModifiers);
-            UpdateHotkeyDisplay(txtPushToTalkHotkey, chkEnablePushToTalk.Checked, pushToTalkKey, pushToTalkModifiers);
-            
+            UpdatePushToTalkDisplays();
+
             // Advanced tab translations
             grpPushToTalk.Text = Translations.PushToTalk(newLanguage);
             chkEnablePushToTalk.Text = Translations.EnableHotkey(newLanguage);
-            lblPushToTalkHotkey.Text = Translations.Hotkey(newLanguage);
+            toolTipPushToTalk.SetToolTip(btnAddPushToTalkKey, Translations.AddPushToTalkKey(newLanguage));
+            foreach (Button btn in pushToTalkRemoveButtons)
+                toolTipPushToTalk.SetToolTip(btn, Translations.RemovePushToTalkKey(newLanguage));
 			lblPushToTalkDesc.Text = Translations.PushToTalkDescription(newLanguage);
             
             grpNotifications.Text = Translations.ToastNotifications(newLanguage);
@@ -2894,6 +3642,94 @@ namespace MicMute
                 lstProfiles.SelectedIndex = selected;
         }
 
+        /// <summary>
+        /// Baut die Zeilen der Push-to-Talk-Tasten aus pushToTalkBindings neu auf.
+        /// Mindestens eine Zeile bleibt sichtbar, damit man eine Taste eintragen kann.
+        /// </summary>
+        private void RebuildPushToTalkRows()
+        {
+            if (pushToTalkBindings.Count == 0)
+                pushToTalkBindings.Add(new HotkeyBinding(Keys.None, Keys.None));
+
+            activeTextBox = null;
+            pushToTalkBoxes.Clear();
+            pushToTalkRemoveButtons.Clear();
+
+            pnlPushToTalkKeys.SuspendLayout();
+            while (pnlPushToTalkKeys.Controls.Count > 0)
+                pnlPushToTalkKeys.Controls[0].Dispose();
+
+            for (int i = 0; i < pushToTalkBindings.Count; i++)
+            {
+                Panel row = new Panel { Size = new Size(350, 27), Margin = new Padding(0) };
+
+                TextBox txt = new TextBox
+                {
+                    Location = new Point(0, 2),
+                    Size = new Size(312, 23),
+                    ReadOnly = true,
+                    Tag = "pushtotalk"
+                };
+                txt.Enter += delegate(object s, EventArgs e) { activeTextBox = (TextBox)s; };
+                txt.KeyDown += TxtHotkey_KeyDown;
+                txt.PreviewKeyDown += TxtHotkey_PreviewKeyDown;
+
+                Button btnRemove = new Button
+                {
+                    Text = "-",
+                    Location = new Point(318, 1),
+                    Size = new Size(28, 25)
+                };
+                toolTipPushToTalk.SetToolTip(btnRemove, Translations.RemovePushToTalkKey(config.AppLanguage));
+                btnRemove.Click += delegate(object s, EventArgs e)
+                {
+                    Button clicked = (Button)s;
+                    int index = pushToTalkRemoveButtons.IndexOf(clicked);
+                    if (index < 0)
+                        return;
+
+                    // Erst nach dem Click-Ereignis neu aufbauen: der Button darf sich
+                    // nicht in seinem eigenen Handler entsorgen. Doppelklick abfangen.
+                    clicked.Enabled = false;
+                    this.BeginInvoke((MethodInvoker)delegate
+                    {
+                        pushToTalkBindings.RemoveAt(index);
+                        RebuildPushToTalkRows();
+                    });
+                };
+
+                row.Controls.Add(txt);
+                row.Controls.Add(btnRemove);
+                pnlPushToTalkKeys.Controls.Add(row);
+
+                pushToTalkBoxes.Add(txt);
+                pushToTalkRemoveButtons.Add(btnRemove);
+            }
+            pnlPushToTalkKeys.ResumeLayout();
+
+            UpdatePushToTalkEnabled();
+        }
+
+        private void UpdatePushToTalkEnabled()
+        {
+            // Wird auch während des Aufbaus aufgerufen
+            if (pnlPushToTalkKeys == null || btnAddPushToTalkKey == null)
+                return;
+
+            pnlPushToTalkKeys.Enabled = chkEnablePushToTalk.Checked;
+            btnAddPushToTalkKey.Enabled = chkEnablePushToTalk.Checked;
+            UpdatePushToTalkDisplays();
+        }
+
+        private void UpdatePushToTalkDisplays()
+        {
+            for (int i = 0; i < pushToTalkBoxes.Count; i++)
+            {
+                UpdateHotkeyDisplay(pushToTalkBoxes[i], chkEnablePushToTalk.Checked,
+                    pushToTalkBindings[i].Key, pushToTalkBindings[i].Modifiers);
+            }
+        }
+
         private void TxtHotkey_PreviewKeyDown(object sender, PreviewKeyDownEventArgs e)
         {
             e.IsInputKey = true;
@@ -2907,6 +3743,7 @@ namespace MicMute
             e.Handled = true;
 
             Keys key = e.KeyCode;
+            int pttIndex = pushToTalkBoxes.IndexOf(activeTextBox);
 
             if (key == Keys.Back || key == Keys.Delete)
             {
@@ -2928,11 +3765,10 @@ namespace MicMute
                     unmuteModifiers = Keys.None;
                     UpdateHotkeyDisplay(txtUnmuteHotkey, chkEnableUnmute.Checked, unmuteKey, unmuteModifiers);
                 }
-                else if (activeTextBox.Tag.ToString() == "pushtotalk")
+                else if (pttIndex >= 0)
                 {
-                    pushToTalkKey = Keys.None;
-                    pushToTalkModifiers = Keys.None;
-                    UpdateHotkeyDisplay(txtPushToTalkHotkey, chkEnablePushToTalk.Checked, pushToTalkKey, pushToTalkModifiers);
+                    pushToTalkBindings[pttIndex] = new HotkeyBinding(Keys.None, Keys.None);
+                    UpdateHotkeyDisplay(activeTextBox, chkEnablePushToTalk.Checked, Keys.None, Keys.None);
                 }
                 return;
             }
@@ -2942,6 +3778,11 @@ namespace MicMute
                 return;
             }
 
+            // Copilot-Taste: Windows sendet LWin + LShift + F23. Win ist in Keys kein
+            // Modifier und als Hotkey ungeeignet: übergehen, die Folgetaste zählt.
+            if (key == Keys.LWin || key == Keys.RWin)
+                return;
+
             Keys modifiers = Keys.None;
             if (e.Control)
                 modifiers |= Keys.Control;
@@ -2949,6 +3790,11 @@ namespace MicMute
                 modifiers |= Keys.Shift;
             if (e.Alt)
                 modifiers |= Keys.Alt;
+
+            // Mit gehaltener Win-Taste (Copilot-Taste) nur die Taste selbst übernehmen:
+            // F23 statt "Shift + F23". Der Hook prüft nur geforderte Modifier.
+            if (Program.IsKeyDownNow(Keys.LWin) || Program.IsKeyDownNow(Keys.RWin))
+                modifiers = Keys.None;
 
             if (activeTextBox.Tag.ToString() == "toggle")
             {
@@ -2968,11 +3814,10 @@ namespace MicMute
                 unmuteModifiers = modifiers;
                 UpdateHotkeyDisplay(txtUnmuteHotkey, chkEnableUnmute.Checked, unmuteKey, unmuteModifiers);
             }
-            else if (activeTextBox.Tag.ToString() == "pushtotalk")
+            else if (pttIndex >= 0)
             {
-                pushToTalkKey = key;
-                pushToTalkModifiers = modifiers;
-                UpdateHotkeyDisplay(txtPushToTalkHotkey, chkEnablePushToTalk.Checked, pushToTalkKey, pushToTalkModifiers);
+                pushToTalkBindings[pttIndex] = new HotkeyBinding(key, modifiers);
+                UpdateHotkeyDisplay(activeTextBox, chkEnablePushToTalk.Checked, key, modifiers);
             }
         }
 
@@ -3004,11 +3849,13 @@ namespace MicMute
 
         /// <summary>
         /// Ein globaler Hotkey ohne Modifier schluckt diese Taste systemweit. Nur für
-        /// Tasten erlaubt, die beim Schreiben ohnehin nicht vorkommen.
+        /// Tasten erlaubt, die beim Schreiben ohnehin nicht vorkommen. Push-to-Talk sperrt
+        /// seine Tasten bewusst (sie wirken nur noch als Push-to-Talk): dort ist jede Taste erlaubt.
         /// </summary>
-        private static bool AllowsStandaloneKey(Keys key)
+        private static bool AllowsStandaloneKey(Keys key, bool pushToTalk)
         {
-            return (key >= Keys.F13 && key <= Keys.F24)
+            return pushToTalk
+                || (key >= Keys.F13 && key <= Keys.F24)
                 || key == Keys.Pause
                 || key == Keys.Scroll;
         }
@@ -3016,21 +3863,23 @@ namespace MicMute
         private bool ValidateHotkeys()
         {
             var active = new List<Keys>();
+            // Tasten der Hotkeys; die Hotkeys stehen in candidates vor Push-to-Talk
+            var hotkeyKeys = new List<Keys>();
 
             var candidates = new[]
             {
-                new { On = chkEnableToggle.Checked,     Key = toggleKey,     Mod = toggleModifiers },
-                new { On = chkEnableMute.Checked,       Key = muteKey,       Mod = muteModifiers },
-                new { On = chkEnableUnmute.Checked,     Key = unmuteKey,     Mod = unmuteModifiers },
-                new { On = chkEnablePushToTalk.Checked, Key = pushToTalkKey, Mod = pushToTalkModifiers }
-            };
+                new { On = chkEnableToggle.Checked, Key = toggleKey, Mod = toggleModifiers, Ptt = false },
+                new { On = chkEnableMute.Checked,   Key = muteKey,   Mod = muteModifiers,   Ptt = false },
+                new { On = chkEnableUnmute.Checked, Key = unmuteKey, Mod = unmuteModifiers, Ptt = false }
+            }.Concat(pushToTalkBindings.Select(b =>
+                new { On = chkEnablePushToTalk.Checked, Key = b.Key, Mod = b.Modifiers, Ptt = true }));
 
             foreach (var c in candidates)
             {
                 if (!c.On || c.Key == Keys.None)
                     continue;
 
-                if (c.Mod == Keys.None && !AllowsStandaloneKey(c.Key))
+                if (c.Mod == Keys.None && !AllowsStandaloneKey(c.Key, c.Ptt))
                 {
                     MessageBox.Show(Translations.HotkeyNeedsModifier(config.AppLanguage),
                         "MicMute", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -3038,7 +3887,10 @@ namespace MicMute
                 }
 
                 Keys combo = c.Key | c.Mod;
-                if (active.Contains(combo))
+                // Push-to-Talk ohne Modifier sperrt die Taste auch mit Strg/Umschalt/Alt
+                // (CheckModifiers duldet zusätzliche Modifier): dann kein Hotkey auf derselben Taste
+                bool sharesHotkeyKey = c.Ptt && c.Mod == Keys.None && hotkeyKeys.Contains(c.Key);
+                if (active.Contains(combo) || sharesHotkeyKey)
                 {
                     MessageBox.Show(Translations.HotkeyDuplicate(config.AppLanguage),
                         "MicMute", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -3046,6 +3898,8 @@ namespace MicMute
                 }
 
                 active.Add(combo);
+                if (!c.Ptt)
+                    hotkeyKeys.Add(c.Key);
             }
 
             return true;
@@ -3073,8 +3927,8 @@ namespace MicMute
             config.HotkeyUnmuteModifiers = unmuteModifiers;
             
             config.PushToTalkEnabled = chkEnablePushToTalk.Checked;
-            config.PushToTalkKey = pushToTalkKey;
-            config.PushToTalkModifiers = pushToTalkModifiers;
+            // Leere Zeilen werden nicht gespeichert
+            config.PushToTalkKeys = pushToTalkBindings.Where(b => b.Key != Keys.None).ToList();
             
             config.ShowToastOnToggle = chkShowToastOnToggle.Checked;
             config.ShowToastOnMute = chkShowToastOnMute.Checked;
