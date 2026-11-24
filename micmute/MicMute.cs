@@ -519,20 +519,35 @@ namespace MicMute
         {
             // Fix: Get the directory where the .exe is located
             string appDir = Path.GetDirectoryName(Application.ExecutablePath);
-            string mutedPath = Path.Combine(appDir, "mic_off.ico");
-            string unmutedPath = Path.Combine(appDir, "mic_on.ico");
+            iconMuted = LoadIconFile(appDir, "mic_off.ico", SystemIcons.Shield);
+            iconUnmuted = LoadIconFile(appDir, "mic_on.ico", SystemIcons.Information);
+        }
 
-            try 
+        /// <summary>
+        /// Datei neben der exe hat Vorrang (eigene Icons), sonst die eingebettete
+        /// Ressource (/resource beim Kompilieren), sonst das Systemsymbol.
+        /// </summary>
+        private static Icon LoadIconFile(string appDir, string fileName, Icon fallback)
+        {
+            try
             {
-                iconMuted = File.Exists(mutedPath) ? new Icon(mutedPath) : SystemIcons.Shield;
+                string path = Path.Combine(appDir, fileName);
+                if (File.Exists(path))
+                    return new Icon(path);
             }
-            catch { iconMuted = SystemIcons.Shield; }
+            catch (Exception ex) { Log("LoadIconFile " + fileName, ex); }
 
             try
             {
-                iconUnmuted = File.Exists(unmutedPath) ? new Icon(unmutedPath) : SystemIcons.Information;
+                using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(fileName))
+                {
+                    if (stream != null)
+                        return new Icon(stream);
+                }
             }
-            catch { iconUnmuted = SystemIcons.Information; }
+            catch (Exception ex) { Log("LoadIconFile (Ressource) " + fileName, ex); }
+
+            return fallback;
         }
 
         private static void RunApp()
