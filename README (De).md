@@ -130,6 +130,7 @@ Schlüssel, die eine Version nicht kennt, bleiben unverändert erhalten. Eine ä
 
 ## Hinweise
 - **Icons**: `mic_on.ico` und `mic_off.ico` sind in die ausführbare Datei eingebettet, eine einzelne `MicMute2.exe` genügt. Icon-Dateien neben der ausführbaren Datei haben Vorrang (eigene Icons). Fehlt beides, weicht das Programm auf ein Systemsymbol aus
+- **Alle Mikrofone**: Stummschalten wirkt auf alle aktiven Aufnahmegeräte, nicht nur auf das Standardgerät. Einschalten öffnet nur die Mikrofone, die vorher offen waren (ohne gemerkten Zustand: die Standardgeräte). Im stummen Zustand prüft MicMute alle 2 Sekunden, ob ein Mikrofon offen ist (z. B. ein neu verbundenes Bluetooth-Headset), und schaltet es stumm. Das Tray-Icon zeigt "stumm" nur, wenn alle bestätigt stumm sind
 - **Konfigurationsdatei**: `MicMuteConfig.ini`, liegt neben der ausführbaren Datei
 - **Protokolldatei**: `MicMuteLog.txt`, liegt neben der ausführbaren Datei und lässt sich über das Tray-Menü öffnen
 - **Sprachwechsel**: Die Sprache kann jederzeit in den Einstellungen geändert werden und wird sofort angewendet

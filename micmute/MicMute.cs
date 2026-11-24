@@ -353,6 +353,8 @@ namespace MicMute
         private const int CLSCTX_ALL = 0x17;
         private const int eCapture = 1;
         private const int eConsole = 0;
+        private const int eCommunications = 2;
+        private const int DEVICE_STATE_ACTIVE = 0x1;
 
         private static readonly Guid CLSID_MMDeviceEnumerator = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
         private static readonly Guid IID_IMMDeviceEnumerator = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
@@ -511,6 +513,8 @@ namespace MicMute
 
                     // SystemEvents hält sonst eine statische Referenz auf den Handler
                     RemoveSessionSwitchHandler();
+
+                    StopMuteGuard();
                 }
             }
         }
@@ -658,6 +662,7 @@ namespace MicMute
             {
                 Log("=== MicMute beendet ===");
                 UnregisterAllHotkeys();
+                StopMuteGuard();
                 if (hotkeyWindow != null) hotkeyWindow.Close();
                 Application.Exit();
             };
@@ -694,7 +699,7 @@ namespace MicMute
 
             if (config.ShowToastOnStartup)
             {
-                string statusText = isMuted ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage);
+                string statusText = (isMuted && !muteIncomplete) ? Translations.MicrophoneOff(config.AppLanguage) : Translations.MicrophoneOn(config.AppLanguage);
                 ShowNotification(string.Format("MicMute gestartet - Mikrofon: {0}", statusText));
             }
 
@@ -712,6 +717,11 @@ namespace MicMute
             }
 
             SetupSessionSwitchHandler();
+
+            muteGuardTimer = new System.Windows.Forms.Timer();
+            muteGuardTimer.Interval = 2000;
+            muteGuardTimer.Tick += MuteGuardTick;
+            UpdateMuteGuardTimer();
 
             GC.KeepAlive(hookCallback);
 
@@ -946,7 +956,8 @@ namespace MicMute
             }
         }
 
-        private static bool? GetSystemMicrophoneMuteState()
+        /// <summary>Nur das Standardgerät - einzig für den WM_APPCOMMAND-Fallback.</summary>
+        private static bool? GetDefaultMicrophoneMuteState()
         {
             IntPtr endpointVolume;
             IAudioEndpointVolumeVtbl volumeVtbl;
@@ -964,7 +975,7 @@ namespace MicMute
             }
             catch (Exception ex)
             {
-                Log("GetSystemMicrophoneMuteState", ex);
+                Log("GetDefaultMicrophoneMuteState", ex);
                 return null;
             }
             finally
@@ -973,33 +984,446 @@ namespace MicMute
             }
         }
 
-        /// <summary>
-        /// Setzt den Mute-Status direkt. Anders als WM_APPCOMMAND ist das kein Toggle,
-        /// sondern idempotent.
-        /// </summary>
-        private static bool SetSystemMicrophoneMuteState(bool muted)
+        /// <summary>Ergebnis einer Stumm-/Einschaltaktion über alle Aufnahmegeräte.</summary>
+        private enum MuteApplyResult { Ok, Partial, Unavailable }
+
+        private struct CaptureEndpoint
         {
-            IntPtr endpointVolume;
-            IAudioEndpointVolumeVtbl volumeVtbl;
+            public string Id;
+            public IntPtr Volume;
+        }
 
-            if (!TryGetEndpointVolume(out endpointVolume, out volumeVtbl))
-                return false;
+        /// <summary>IDs der Geräte, die vor dem Stummschalten offen waren. Nur im Speicher.</summary>
+        private static readonly HashSet<string> reactivateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>true, solange isMuted gilt, aber nicht alle Geräte bestätigt stumm sind.</summary>
+        private static bool muteIncomplete = false;
+
+        private static string lastGuardMessage;
+
+        private static string GetDeviceId(IntPtr device)
+        {
+            IntPtr idPtr = IntPtr.Zero;
+            try
+            {
+                var deviceVtbl = (IMMDeviceVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(device), typeof(IMMDeviceVtbl));
+                if (deviceVtbl.GetId(device, out idPtr) != 0 || idPtr == IntPtr.Zero)
+                    return null;
+                return Marshal.PtrToStringUni(idPtr);
+            }
+            catch (Exception ex)
+            {
+                Log("GetDeviceId", ex);
+                return null;
+            }
+            finally
+            {
+                // GetId liefert CoTaskMem-Speicher
+                if (idPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(idPtr);
+            }
+        }
+
+        /// <summary>
+        /// Alle aktiven Aufnahmegeräte mit ID und IAudioEndpointVolume, nicht nur das
+        /// Standardgerät: Teams & Co. nehmen oft das Kommunikationsgerät oder ein eigenes.
+        /// Der Aufrufer muss ReleaseEndpoints() aufrufen. Leere Liste = nicht verfügbar.
+        /// </summary>
+        private static List<CaptureEndpoint> GetActiveCaptureEndpoints()
+        {
+            var result = new List<CaptureEndpoint>();
+            IntPtr deviceEnumerator = IntPtr.Zero;
+            IntPtr collection = IntPtr.Zero;
+
+            try
+            {
+                Guid clsid = CLSID_MMDeviceEnumerator;
+                Guid iid = IID_IMMDeviceEnumerator;
+
+                int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC_SERVER, ref iid, out deviceEnumerator);
+                if (hr != 0 || deviceEnumerator == IntPtr.Zero)
+                    return result;
+
+                var vtbl = (IMMDeviceEnumeratorVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(deviceEnumerator), typeof(IMMDeviceEnumeratorVtbl));
+
+                hr = vtbl.EnumAudioEndpoints(deviceEnumerator, eCapture, DEVICE_STATE_ACTIVE, out collection);
+                if (hr != 0 || collection == IntPtr.Zero)
+                    return result;
+
+                var collectionVtbl = (IMMDeviceCollectionVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(collection), typeof(IMMDeviceCollectionVtbl));
+
+                uint count;
+                if (collectionVtbl.GetCount(collection, out count) != 0)
+                    return result;
+
+                for (uint i = 0; i < count; i++)
+                {
+                    IntPtr device = IntPtr.Zero;
+                    try
+                    {
+                        if (collectionVtbl.Item(collection, i, out device) != 0 || device == IntPtr.Zero)
+                            continue;
+
+                        var deviceVtbl = (IMMDeviceVtbl)Marshal.PtrToStructure(
+                            Marshal.ReadIntPtr(device), typeof(IMMDeviceVtbl));
+
+                        Guid volumeIid = IID_IAudioEndpointVolume;
+                        IntPtr endpointVolume;
+                        if (deviceVtbl.Activate(device, ref volumeIid, CLSCTX_ALL, IntPtr.Zero, out endpointVolume) == 0
+                            && endpointVolume != IntPtr.Zero)
+                        {
+                            CaptureEndpoint ep;
+                            ep.Id = GetDeviceId(device);
+                            ep.Volume = endpointVolume;
+                            result.Add(ep);
+                        }
+                    }
+                    finally
+                    {
+                        SafeRelease(device);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("GetActiveCaptureEndpoints", ex);
+            }
+            finally
+            {
+                SafeRelease(collection);
+                SafeRelease(deviceEnumerator);
+            }
+
+            return result;
+        }
+
+        private static void ReleaseEndpoints(List<CaptureEndpoint> endpoints)
+        {
+            foreach (CaptureEndpoint ep in endpoints)
+                SafeRelease(ep.Volume);
+        }
+
+        /// <summary>IDs der Standard-Aufnahmegeräte für Konsole und Kommunikation.</summary>
+        private static HashSet<string> GetDefaultCaptureIds()
+        {
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            IntPtr deviceEnumerator = IntPtr.Zero;
+
+            try
+            {
+                Guid clsid = CLSID_MMDeviceEnumerator;
+                Guid iid = IID_IMMDeviceEnumerator;
+
+                int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC_SERVER, ref iid, out deviceEnumerator);
+                if (hr != 0 || deviceEnumerator == IntPtr.Zero)
+                    return ids;
+
+                var vtbl = (IMMDeviceEnumeratorVtbl)Marshal.PtrToStructure(
+                    Marshal.ReadIntPtr(deviceEnumerator), typeof(IMMDeviceEnumeratorVtbl));
+
+                foreach (int role in new[] { eConsole, eCommunications })
+                {
+                    IntPtr device = IntPtr.Zero;
+                    try
+                    {
+                        if (vtbl.GetDefaultAudioEndpoint(deviceEnumerator, eCapture, role, out device) == 0 && device != IntPtr.Zero)
+                        {
+                            string id = GetDeviceId(device);
+                            if (id != null) ids.Add(id);
+                        }
+                    }
+                    finally
+                    {
+                        SafeRelease(device);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("GetDefaultCaptureIds", ex);
+            }
+            finally
+            {
+                SafeRelease(deviceEnumerator);
+            }
+
+            return ids;
+        }
+
+        private static IAudioEndpointVolumeVtbl GetVolumeVtbl(IntPtr endpointVolume)
+        {
+            return (IAudioEndpointVolumeVtbl)Marshal.PtrToStructure(
+                Marshal.ReadIntPtr(endpointVolume), typeof(IAudioEndpointVolumeVtbl));
+        }
+
+        /// <summary>1 = stumm, 0 = offen, -1 = nicht lesbar.</summary>
+        private static int ReadMute(IntPtr endpointVolume)
+        {
+            try
+            {
+                int muted;
+                if (GetVolumeVtbl(endpointVolume).GetMute(endpointVolume, out muted) < 0)
+                    return -1;
+                return muted != 0 ? 1 : 0;
+            }
+            catch (Exception ex)
+            {
+                Log("ReadMute", ex);
+                return -1;
+            }
+        }
+
+        private static void WriteMute(IntPtr endpointVolume, bool muted)
+        {
             try
             {
                 Guid eventContext = Guid.Empty;
                 // S_FALSE (1) bedeutet "war bereits in diesem Zustand" und ist ein Erfolg.
-                return volumeVtbl.SetMute(endpointVolume, muted ? 1 : 0, ref eventContext) >= 0;
+                GetVolumeVtbl(endpointVolume).SetMute(endpointVolume, muted ? 1 : 0, ref eventContext);
             }
             catch (Exception ex)
             {
-                Log("SetSystemMicrophoneMuteState", ex);
-                return false;
+                Log("WriteMute", ex);
+            }
+        }
+
+        /// <summary>Liest nach dem Schreiben bis ~200 ms nach: Bluetooth-Geräte melden den neuen Zustand verzögert.</summary>
+        private static bool ConfirmMute(IntPtr endpointVolume, bool expectedMuted)
+        {
+            int expected = expectedMuted ? 1 : 0;
+            Stopwatch watch = Stopwatch.StartNew();
+
+            while (true)
+            {
+                if (ReadMute(endpointVolume) == expected)
+                    return true;
+                if (watch.ElapsedMilliseconds >= 200)
+                    return false;
+                Thread.Sleep(15);
+            }
+        }
+
+        private static string JoinIds(IEnumerable<string> ids)
+        {
+            string joined = string.Join(", ", ids.ToArray());
+            return joined.Length == 0 ? "-" : joined;
+        }
+
+        /// <summary>
+        /// Stumm nur, wenn ALLE aktiven Aufnahmegeräte stumm sind. Ein nicht lesbares
+        /// Gerät gilt als nicht stumm. null ohne Geräteliste.
+        /// </summary>
+        private static bool? GetSystemMicrophoneMuteState()
+        {
+            List<CaptureEndpoint> endpoints = GetActiveCaptureEndpoints();
+            try
+            {
+                if (endpoints.Count == 0)
+                    return null;
+
+                foreach (CaptureEndpoint ep in endpoints)
+                {
+                    if (ReadMute(ep.Volume) != 1)
+                        return false;
+                }
+                return true;
             }
             finally
             {
-                SafeRelease(endpointVolume);
+                ReleaseEndpoints(endpoints);
             }
+        }
+
+        /// <summary>
+        /// Schaltet alle aktiven Aufnahmegeräte stumm. Geräte, die vorher offen waren, kommen
+        /// in reactivateIds - nur sie werden beim Einschalten wieder geöffnet. Danach wird
+        /// nachgelesen: Ok nur, wenn wirklich alle stumm sind.
+        /// explicitAction = false: Aufruf aus der Kontrolle, loggt nur bei Handlung und ohne Wiederholung.
+        /// </summary>
+        private static MuteApplyResult MuteAllMicrophones(bool explicitAction)
+        {
+            string label = explicitAction ? "Stummschalten" : "Kontrolle";
+            List<CaptureEndpoint> endpoints = GetActiveCaptureEndpoints();
+
+            try
+            {
+                if (endpoints.Count == 0)
+                {
+                    if (explicitAction) Log(label + ": keine aktiven Aufnahmegeräte gefunden");
+                    return MuteApplyResult.Unavailable;
+                }
+
+                var acted = new List<CaptureEndpoint>();
+                foreach (CaptureEndpoint ep in endpoints)
+                {
+                    int state = ReadMute(ep.Volume);
+                    if (state == 1)
+                        continue;
+                    if (state == 0 && ep.Id != null)
+                        reactivateIds.Add(ep.Id);
+                    WriteMute(ep.Volume, true);
+                    acted.Add(ep);
+                }
+
+                if (acted.Count == 0)
+                {
+                    if (explicitAction)
+                        Log(string.Format("{0}: alle {1} Mikrofone bereits stumm", label, endpoints.Count));
+                    lastGuardMessage = null;
+                    return MuteApplyResult.Ok;
+                }
+
+                var failed = new List<string>();
+                foreach (CaptureEndpoint ep in acted)
+                {
+                    if (!ConfirmMute(ep.Volume, true))
+                        failed.Add(ep.Id ?? "?");
+                }
+
+                string message = string.Format("{0}: {1} Mikrofone aktiv, {2} stummgeschaltet, fehlgeschlagen: {3} - IDs: {4}",
+                    label, endpoints.Count, acted.Count - failed.Count, JoinIds(failed),
+                    JoinIds(acted.Select(ep => ep.Id ?? "?")));
+
+                // Die Kontrolle alle 2 s soll das Protokoll bei Dauerfehlern nicht fluten.
+                if (explicitAction || message != lastGuardMessage)
+                    Log(message);
+                lastGuardMessage = explicitAction ? null : message;
+
+                return failed.Count == 0 ? MuteApplyResult.Ok : MuteApplyResult.Partial;
+            }
+            finally
+            {
+                ReleaseEndpoints(endpoints);
+            }
+        }
+
+        /// <summary>
+        /// Öffnet nur die Geräte, die vor dem Stummschalten offen waren. Ohne Gedächtnis
+        /// (Start mit bereits stummen Geräten, oder die gemerkten Geräte sind weg) werden die
+        /// Standardgeräte für Konsole und Kommunikation geöffnet - die nutzen Teams & Co.;
+        /// "alle" würde ein absichtlich stummes Mikrofon öffnen.
+        /// </summary>
+        private static MuteApplyResult UnmuteRememberedMicrophones()
+        {
+            List<CaptureEndpoint> endpoints = GetActiveCaptureEndpoints();
+
+            try
+            {
+                if (endpoints.Count == 0)
+                {
+                    Log("Einschalten: keine aktiven Aufnahmegeräte gefunden");
+                    return MuteApplyResult.Unavailable;
+                }
+
+                string rule = "vorher offene";
+                var targets = new HashSet<string>(
+                    endpoints.Where(ep => ep.Id != null && reactivateIds.Contains(ep.Id)).Select(ep => ep.Id),
+                    StringComparer.OrdinalIgnoreCase);
+
+                if (targets.Count == 0)
+                {
+                    targets = GetDefaultCaptureIds();
+                    rule = "Standardgeräte";
+                }
+
+                var opened = new List<string>();
+                var failed = new List<string>();
+                foreach (CaptureEndpoint ep in endpoints)
+                {
+                    if (ep.Id == null || !targets.Contains(ep.Id))
+                        continue;
+                    WriteMute(ep.Volume, false);
+                    if (ConfirmMute(ep.Volume, false)) opened.Add(ep.Id); else failed.Add(ep.Id);
+                }
+
+                reactivateIds.Clear();
+
+                Log(string.Format("Einschalten ({0}): {1} Mikrofone aktiv, {2} geöffnet, fehlgeschlagen: {3} - IDs: {4}",
+                    rule, endpoints.Count, opened.Count, JoinIds(failed), JoinIds(opened)));
+
+                return failed.Count == 0 && opened.Count > 0 ? MuteApplyResult.Ok : MuteApplyResult.Partial;
+            }
+            finally
+            {
+                ReleaseEndpoints(endpoints);
+            }
+        }
+
+        /// <summary>Merkt sich unvollständiges Stummschalten; Hinweis immer, auch bei abgeschalteten Toasts.</summary>
+        private static void SetMuteIncomplete(bool incomplete)
+        {
+            if (incomplete && !muteIncomplete)
+            {
+                Log("WARNUNG: nicht alle Mikrofone stumm - Icon zeigt nicht \"stumm\"");
+                ShowNotification(Translations.MuteIncomplete(config.AppLanguage));
+            }
+            else if (!incomplete && muteIncomplete && isMuted)
+            {
+                Log("Alle Mikrofone jetzt stumm");
+            }
+
+            muteIncomplete = incomplete;
+        }
+
+        // ponytail: Hier bewusst Polling statt Ereignis (anders als der WinEvent-Hook oben):
+        // ponytail: IMMNotificationClient bräuchte COM-Rückrufe auf fremden Threads. Der Tick
+        // ponytail: läuft nur im stummen Zustand, auf dem UI-Thread, und erkennt neue Geräte
+        // ponytail: genauso wie von außen wieder geöffnete.
+        private static System.Windows.Forms.Timer muteGuardTimer;
+
+        private static void UpdateMuteGuardTimer()
+        {
+            if (muteGuardTimer != null)
+                muteGuardTimer.Enabled = isMuted;
+        }
+
+        private static void MuteGuardTick(object sender, EventArgs e)
+        {
+            try
+            {
+                if (!isMuted)
+                {
+                    UpdateMuteGuardTimer();
+                    return;
+                }
+
+                MuteApplyResult result = MuteAllMicrophones(false);
+                if (result == MuteApplyResult.Unavailable)
+                    return;
+
+                bool wasIncomplete = muteIncomplete;
+                SetMuteIncomplete(result != MuteApplyResult.Ok);
+                if (wasIncomplete != muteIncomplete)
+                {
+                    UpdateTrayIcon();
+                    SyncLed(isMuted && !muteIncomplete);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("MuteGuardTick", ex);
+            }
+        }
+
+        /// <summary>Idempotent: aus dem Beenden-Menü und aus dem finally von Main.</summary>
+        private static void StopMuteGuard()
+        {
+            if (muteGuardTimer == null)
+                return;
+
+            try
+            {
+                muteGuardTimer.Stop();
+                muteGuardTimer.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log("StopMuteGuard", ex);
+            }
+
+            muteGuardTimer = null;
         }
 
         private static void LoadMicStateFromFile()
@@ -1048,11 +1472,30 @@ namespace MicMute
             // EnumAudioEndpoints ist Slot 3 des Interfaces. Fehlte bis v2.2.0, dadurch
             // landete jeder GetDefaultAudioEndpoint-Aufruf auf EnumAudioEndpoints und
             // scheiterte mit E_INVALIDARG (0x80070057) - der Mute-Status wurde nie gelesen.
-            public IntPtr EnumAudioEndpoints;
+            public EnumAudioEndpointsDelegate EnumAudioEndpoints;
             public GetDefaultAudioEndpointDelegate GetDefaultAudioEndpoint;
 
             [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int EnumAudioEndpointsDelegate(IntPtr This, int dataFlow, int dwStateMask, out IntPtr ppDevices);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
             public delegate int GetDefaultAudioEndpointDelegate(IntPtr This, int dataFlow, int role, out IntPtr ppDevice);
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IMMDeviceCollectionVtbl
+        {
+            public IntPtr QueryInterface;
+            public IntPtr AddRef;
+            public IntPtr Release;
+            public GetCountDelegate GetCount;
+            public ItemDelegate Item;
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int GetCountDelegate(IntPtr This, out uint pcDevices);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int ItemDelegate(IntPtr This, uint nDevice, out IntPtr ppDevice);
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1063,11 +1506,14 @@ namespace MicMute
             public IntPtr Release;
             public ActivateDelegate Activate;
             public IntPtr OpenPropertyStore;
-            public IntPtr GetId;
+            public GetIdDelegate GetId;
             public IntPtr GetState;
 
             [UnmanagedFunctionPointer(CallingConvention.StdCall)]
             public delegate int ActivateDelegate(IntPtr This, ref Guid iid, int dwClsCtx, IntPtr pActivationParams, out IntPtr ppInterface);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate int GetIdDelegate(IntPtr This, out IntPtr ppstrId);
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1102,7 +1548,8 @@ namespace MicMute
 
         private static void ToggleMic(object sender, EventArgs e)
         {
-            SetMicMuted(!isMuted, MuteSource.Toggle);
+            // Umschalten nach dem angezeigten Zustand: bei unvollständigem Stumm erneut stummschalten.
+            SetMicMuted(!(isMuted && !muteIncomplete), MuteSource.Toggle);
         }
 
         private static void SetMicMutedExplicit(object sender, EventArgs e)
@@ -1124,23 +1571,31 @@ namespace MicMute
         {
             isMuted = muted;
 
-            if (!SetSystemMicrophoneMuteState(muted))
+            MuteApplyResult result = muted ? MuteAllMicrophones(true) : UnmuteRememberedMicrophones();
+
+            if (result == MuteApplyResult.Unavailable)
             {
-                // Fallback für Systeme ohne nutzbares IAudioEndpointVolume.
-                // WM_APPCOMMAND ist ein Toggle, wird also nur bei echtem Unterschied gesendet.
-                bool? actualSystemState = GetSystemMicrophoneMuteState();
-                if (!actualSystemState.HasValue || actualSystemState.Value != muted)
+                // Fallback nur ohne nutzbare Geräteliste. WM_APPCOMMAND ist ein Toggle und trifft
+                // nur das Standardgerät: senden nur, wenn dessen Zustand bekannt und anders ist.
+                bool? defaultState = GetDefaultMicrophoneMuteState();
+                IntPtr hwnd = GetForegroundWindow();
+                if (defaultState.HasValue && defaultState.Value != muted && hwnd != IntPtr.Zero)
                 {
-                    IntPtr hwnd = GetForegroundWindow();
-                    if (hwnd != IntPtr.Zero)
-                    {
-                        SendMessageW(hwnd, WM_APPCOMMAND, hwnd, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
-                    }
+                    SendMessageW(hwnd, WM_APPCOMMAND, hwnd, (IntPtr)APPCOMMAND_MICROPHONE_VOLUME_MUTE);
+                    Log("Geräteliste nicht verfügbar - WM_APPCOMMAND an das Standardgerät gesendet");
+                }
+                else
+                {
+                    Log("Geräteliste nicht verfügbar - kein Fallback (Zustand des Standardgeräts unbekannt oder schon richtig)");
                 }
             }
 
+            // Rot nur bei bestätigtem Stumm aller Mikrofone.
+            SetMuteIncomplete(muted && result != MuteApplyResult.Ok);
+
             UpdateTrayIcon();
-            SyncLed(muted);
+            SyncLed(isMuted && !muteIncomplete);
+            UpdateMuteGuardTimer();
 
             // Push-to-Talk feuert pro Tastendruck - dabei nicht bei jedem Anschlag
             // die komplette Konfigurationsdatei neu schreiben.
@@ -1192,13 +1647,16 @@ namespace MicMute
         {
             try
             {
-                trayIcon.Icon = isMuted ? iconMuted : iconUnmuted;
-                trayIcon.Text = Translations.TrayStatus(config.AppLanguage, isMuted);
+                // Rot nur, wenn das Nachlesen bestätigt hat, dass wirklich alle stumm sind.
+                bool shownMuted = isMuted && !muteIncomplete;
+                trayIcon.Icon = shownMuted ? iconMuted : iconUnmuted;
+                trayIcon.Text = Translations.TrayStatus(config.AppLanguage, shownMuted);
 
                 if (statusItem != null)
-                    statusItem.Text = Translations.TrayStatus(config.AppLanguage, isMuted);
+                    statusItem.Text = Translations.TrayStatus(config.AppLanguage, shownMuted);
 
-                muteItem.Visible = !isMuted;
+                // Bei unvollständigem Stummschalten beides anbieten: erneut versuchen oder aufgeben.
+                muteItem.Visible = !shownMuted;
                 unmuteItem.Visible = isMuted;
             }
             catch (Exception ex)
@@ -1286,19 +1744,15 @@ namespace MicMute
                     {
                         ToggleMic(null, EventArgs.Empty);
                     }
+                    // SetMute ist idempotent: kein Vergleich mit isMuted, damit "Stumm"
+                    // bei unvollständigem Stummschalten erneut versucht wird.
                     else if (m.WParam.ToInt32() == HOTKEY_ID_MUTE)
                     {
-                        if (!isMuted)
-                        {
-                            SetMicMutedExplicit(null, EventArgs.Empty);
-                        }
+                        SetMicMutedExplicit(null, EventArgs.Empty);
                     }
                     else if (m.WParam.ToInt32() == HOTKEY_ID_UNMUTE)
                     {
-                        if (isMuted)
-                        {
-                            SetMicUnmutedExplicit(null, EventArgs.Empty);
-                        }
+                        SetMicUnmutedExplicit(null, EventArgs.Empty);
                     }
                 }
                 base.WndProc(ref m);
@@ -1392,6 +1846,13 @@ namespace MicMute
         public static string ClickHerePress(Language lang)
         {
             return lang == Language.German ? "Hier klicken und Tastenkombination drücken..." : "Click here and press a key combination...";
+        }
+
+        public static string MuteIncomplete(Language lang)
+        {
+            return lang == Language.German
+                ? "Nicht alle Mikrofone konnten stummgeschaltet werden - siehe Protokoll."
+                : "Not all microphones could be muted - see log.";
         }
 
         public static string TrayIconClickBehavior(Language lang)

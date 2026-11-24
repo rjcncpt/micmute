@@ -129,6 +129,7 @@ Keys that a given version does not recognise are preserved unchanged, so an olde
 
 ## Notes
 - **Icons**: `mic_on.ico` and `mic_off.ico` are embedded into the executable, so a single `MicMute2.exe` is enough. Icon files placed next to the executable take precedence (custom icons). If neither is available, the application falls back to a system icon
+- **All microphones**: Muting applies to every active recording device, not only the default one. Unmuting reopens only the microphones that were open before (without remembered state: the default devices). While muted, MicMute checks every 2 seconds for an open microphone (e.g. a newly connected Bluetooth headset) and mutes it. The tray icon shows "muted" only when all of them are confirmed muted
 - **Configuration file**: `MicMuteConfig.ini`, stored next to the executable
 - **Log file**: `MicMuteLog.txt`, stored next to the executable, can be opened from the tray menu
 - **Language switching**: The language can be changed at any time in settings and is applied immediately
